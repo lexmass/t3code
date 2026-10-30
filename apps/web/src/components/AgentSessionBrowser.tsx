@@ -36,7 +36,15 @@ export function AgentSessionBrowser({
     agentSessionBrowse({
       environmentId: project.environmentId,
       input: {
-        workspaceRoot: project.workspaceRoot,
+        projectId: project.id,
+      },
+    }),
+  );
+  const previewResult = useAtomValue(
+    agentSessionBrowse({
+      environmentId: project.environmentId,
+      input: {
+        projectId: project.id,
         ...(selected
           ? {
               preview: {
@@ -58,7 +66,7 @@ export function AgentSessionBrowser({
         .toLowerCase()
         .includes(query.toLowerCase()),
   );
-  const preview = data?.sessions.find(
+  const preview = AsyncResult.getOrElse(previewResult, () => null)?.sessions.find(
     (session) =>
       session.providerInstanceId === selected?.providerInstanceId &&
       session.providerSessionId === selected.providerSessionId,
@@ -123,6 +131,7 @@ export function AgentSessionBrowser({
                 <option value="all">All providers</option>
                 <option value="codex">Codex</option>
                 <option value="claudeAgent">Claude Code</option>
+                <option value="pi">Pi</option>
               </select>
             </label>
             <p className="text-xs text-muted-foreground">
@@ -150,8 +159,12 @@ export function AgentSessionBrowser({
                       <span className="block truncate">{session.title}</span>
                     </Button>
                     <p className="text-xs text-muted-foreground">
-                      {session.provider === "codex" ? "Codex" : "Claude Code"} ·{" "}
-                      {new Date(session.updatedAt).toLocaleString()}
+                      {session.provider === "codex"
+                        ? "Codex"
+                        : session.provider === "pi"
+                          ? "Pi"
+                          : "Claude Code"}{" "}
+                      · {new Date(session.updatedAt).toLocaleString()}
                     </p>
                   </div>
                   <div className="shrink-0">
@@ -189,6 +202,7 @@ export function AgentSessionBrowser({
                   {selected.resumeLimitation ??
                     "Native resume available. The provider checks availability when you send your next message."}
                 </p>
+                {previewResult.waiting ? <p role="status">Loading preview…</p> : null}
                 {preview?.historyLimitation ? (
                   <p role="alert">{preview.historyLimitation}</p>
                 ) : null}

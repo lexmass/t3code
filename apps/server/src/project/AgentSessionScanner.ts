@@ -37,7 +37,9 @@ import { repositoryPathFromRemoteUrl } from "@t3tools/source-control-core/server
 import * as ServerConfig from "../config.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
+import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import { resolvePiSessionsDir } from "@t3tools/provider-pi/server/usage";
 import * as ServerSettings from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import {
@@ -83,6 +85,10 @@ const CodexTurnMetadata = Schema.Struct({
 
 const TranscriptRecord = Schema.Struct({
   type: Schema.optional(Schema.String),
+  // Pi entries form a tree through id/parentId; session_info entries carry its name.
+  id: Schema.optional(Schema.String),
+  parentId: Schema.optional(Schema.NullOr(Schema.String)),
+  name: Schema.optional(Schema.String),
   timestamp: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   sessionId: Schema.optional(Schema.String),
@@ -111,6 +117,13 @@ const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
 const decodeCodexSettings = Schema.decodeUnknownOption(CodexSettings);
 const decodeTranscriptRecord = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptRecord));
 const decodeTranscriptValue = Schema.decodeUnknownOption(TranscriptRecord);
+const decodePiEntryLinks = Schema.decodeUnknownOption(
+  Schema.Struct({
+    type: TranscriptRecord.fields.type,
+    id: TranscriptRecord.fields.id,
+    parentId: TranscriptRecord.fields.parentId,
+  }),
+);
 const selectTranscriptPath = createTranscriptJsonSelector(TranscriptRecord);
 const decodeCodexTurnMetadata = Schema.decodeUnknownOption(CodexTurnMetadata);
 
@@ -135,6 +148,7 @@ export interface AgentSessionThread {
   readonly providerSessionId: string;
   readonly title: string;
   readonly model: string | null;
+  readonly reasoningEffort?: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
@@ -312,6 +326,39 @@ function deriveTitle(source: AgentSessionSource, text: string): string | undefin
   return request.trim().split("\n")[0]?.slice(0, 100).trim() || undefined;
 }
 
+// Pi keeps abandoned branches in the file; its active branch runs from the last entry to the root.
+function activePiBranch(
+  records: ReadonlyArray<DecodedTranscriptRecord>,
+): ReadonlyArray<DecodedTranscriptRecord> {
+  const entries = records.filter((record) => record.type !== "session");
+  const leaf = entries.at(-1);
+  // Version 1 sessions predate the tree and are linear.
+  if (leaf?.id === undefined) return entries;
+  const byId = new Map(
+    entries.flatMap((entry) => (entry.id === undefined ? [] : [[entry.id, entry] as const])),
+  );
+  const branch: Array<DecodedTranscriptRecord> = [];
+  for (
+    let entry: DecodedTranscriptRecord | undefined = leaf;
+    entry !== undefined && branch.length < entries.length;
+    entry = entry.parentId ? byId.get(entry.parentId) : undefined
+  ) {
+    branch.push(entry);
+  }
+  return branch.toReversed();
+}
+
+function isPiConversationRecord(
+  record: DecodedTranscriptRecord,
+): record is DecodedTranscriptRecord & {
+  readonly message: typeof TranscriptMessage.Type & { readonly role: "user" | "assistant" };
+} {
+  return (
+    record.type === "message" &&
+    (record.message?.role === "user" || record.message?.role === "assistant")
+  );
+}
+
 export function parseAgentSessionTranscript(
   input: AgentSessionTranscriptMetadata & {
     readonly contents: string;
@@ -336,8 +383,16 @@ function parseAgentSessionRecords(
   // Claude filenames are session IDs. Codex rollout filenames include extra
   // timestamp text, so only transcript metadata can provide a resumable ID.
   let providerSessionId =
-    input.source === "codex" ? "" : (claudeFields.sessionId ?? input.fallbackSessionId);
-  const title = claudeFields.title ?? null;
+    input.source === "codex"
+      ? ""
+      : input.source === "pi"
+        ? records.find((record) => record.type === "session")?.id?.trim() || input.fallbackSessionId
+        : (claudeFields.sessionId ?? input.fallbackSessionId);
+  // Pi titles a session by its latest session_info on any branch; an empty name clears it.
+  const title =
+    input.source === "pi"
+      ? records.findLast((record) => record.type === "session_info")?.name?.trim() || null
+      : (claudeFields.title ?? null);
   let model = claudeFields.model ?? null;
   let derivedTitle: string | undefined;
   let hasCodexSessionId = false;
@@ -428,8 +483,20 @@ function parseAgentSessionRecords(
   };
 
   let recordIndex = -1;
-  for (const record of records) {
+  for (const record of input.source === "pi" ? activePiBranch(records) : records) {
     recordIndex += 1;
+    if (input.source === "pi") {
+      if (!isPiConversationRecord(record)) continue;
+      const text = extractText(record.message.content);
+      if (text.length === 0) continue;
+      retainMessage({
+        role: record.message.role,
+        text,
+        createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+        codexResponseUser: false,
+      });
+      continue;
+    }
     if (input.source === "claudeAgent") {
       if (isHiddenClaudeRecord(record)) continue;
       if (record.type !== "user" && record.type !== "assistant") continue;
@@ -532,6 +599,8 @@ function shouldRetainDecodedRecord(
   source: AgentSessionSource,
   record: DecodedTranscriptRecord,
 ): boolean {
+  // Any Pi entry can be a link on the active branch.
+  if (source === "pi") return true;
   if (source === "claudeAgent") {
     if (isHiddenClaudeRecord(record) || (record.type !== "user" && record.type !== "assistant")) {
       return false;
@@ -650,6 +719,7 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   // Concurrent client imports must not hold multiple selected-history budgets.
   const importReadLock = yield* Semaphore.make(1);
+  const browseLock = yield* Semaphore.make(1);
   const path = yield* Path.Path;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -874,15 +944,29 @@ export const make = Effect.gen(function* () {
               reader.write(decoder.decode());
               recordCount += 1;
               if (recordCount > recordLimit) return false;
-              const decoded = decodeTranscriptValue(reader.finish());
-              if (Option.isSome(decoded)) {
+              const value = reader.finish();
+              const decoded = decodeTranscriptValue(value);
+              if (Option.isNone(decoded) && source === "pi") {
+                // Pi accepts messages this schema rejects, such as null content; keep their tree links.
+                records.push(...Option.toArray(decodePiEntryLinks(value)));
+              } else if (Option.isSome(decoded)) {
                 if (Option.isNone(cwd)) cwd = Option.fromNullOr(extractDecodedCwd(decoded.value));
                 if (source === "claudeAgent") {
                   claudeFields = foldClaudeFields(claudeFields, decoded.value);
                 }
                 if (shouldRetainDecodedRecord(source, decoded.value)) {
-                  records.push(decoded.value);
-                  historyBytes += recordBytes;
+                  if (
+                    source === "pi" &&
+                    decoded.value.type === "message" &&
+                    !isPiConversationRecord(decoded.value)
+                  ) {
+                    // Tool output can dwarf the conversation; keep only the tree links.
+                    const { message: _message, ...links } = decoded.value;
+                    records.push(links);
+                  } else {
+                    records.push(decoded.value);
+                    historyBytes += recordBytes;
+                  }
                 }
               }
               recordBytes = 0;
@@ -1061,6 +1145,59 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  // Pi nests sessions in one directory per cwd, but a custom session directory holds them flat.
+  const discoverPiTranscripts = Effect.fn("AgentSessionScanner.discoverPiTranscripts")(function* (
+    sessionsDir: string,
+    providerInstanceId: ProviderInstanceId,
+    operationBudget: number,
+  ) {
+    let operationsRemaining = operationBudget;
+    let truncated = false;
+    const readDirectory = (directory: string) => {
+      if (operationsRemaining <= 0) {
+        truncated = true;
+        return Effect.succeed<ReadonlyArray<string>>([]);
+      }
+      operationsRemaining -= 1;
+      return listDirectory(directory);
+    };
+    const transcripts: Array<TranscriptCandidate> = [];
+    for (const entry of yield* readDirectory(sessionsDir)) {
+      if (operationsRemaining <= 0) {
+        truncated = true;
+        break;
+      }
+      const entryPath = path.join(sessionsDir, entry);
+      const filePaths = entry.endsWith(".jsonl")
+        ? [entryPath]
+        : (yield* readDirectory(entryPath))
+            .filter((nested) => nested.endsWith(".jsonl"))
+            .map((nested) => path.join(entryPath, nested));
+
+      for (const filePath of filePaths) {
+        if (operationsRemaining <= 0) {
+          truncated = true;
+          break;
+        }
+        operationsRemaining -= 1;
+        const stats = yield* statOption(filePath);
+        if (
+          Option.isSome(stats) &&
+          stats.value.type === "File" &&
+          Option.isSome(stats.value.mtime)
+        ) {
+          transcripts.push({
+            filePath,
+            mtimeMs: stats.value.mtime.value.getTime(),
+            providerInstanceId,
+            size: Number(stats.value.size),
+          });
+        }
+      }
+    }
+    return { transcripts, truncated };
+  });
+
   const groupTranscriptsByCwd = Effect.fn("AgentSessionScanner.groupTranscriptsByCwd")(function* (
     source: AgentSessionSource,
     transcripts: ReadonlyArray<TranscriptCandidate>,
@@ -1121,7 +1258,7 @@ export const make = Effect.gen(function* () {
     const raw: Array<RawCandidate> = [];
     let truncated = false;
 
-    for (const source of ["claudeAgent", "codex"] as const) {
+    for (const source of ["claudeAgent", "codex", "pi"] as const) {
       const instances: Array<{
         readonly instanceId: ProviderInstanceId;
         readonly config: ProviderInstanceConfig;
@@ -1155,24 +1292,36 @@ export const make = Effect.gen(function* () {
       }> = [];
       const seenHomes = new Set<string>();
       for (const { instanceId, config: instance } of instances) {
-        const homeVariable = source === "claudeAgent" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME";
-        const environmentHome =
-          instance.environment?.findLast((variable) => variable.name === homeVariable)?.value ??
-          hostEnvironment[homeVariable];
+        const environmentHome = (name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME") => {
+          const configured = instance.environment?.findLast(
+            (variable) => variable.name === name,
+          )?.value;
+          return typeof configured === "string" ? configured : hostEnvironment[name];
+        };
 
         let homePath: string;
-        if (source === "claudeAgent") {
+        if (source === "pi") {
+          const environment = yield* mergeProviderInstanceEnvironment(
+            instance.environment,
+            hostEnvironment,
+          ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
+          homePath = resolvePiSessionsDir(environment, homeDir, path);
+        } else if (source === "claudeAgent") {
           const config = decodeClaudeSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
-          homePath = resolveClaudeConfigDir(config.value.homePath, environmentHome);
+          homePath = resolveClaudeConfigDir(
+            config.value.homePath,
+            environmentHome("CLAUDE_CONFIG_DIR"),
+          );
         } else {
           const config = decodeCodexSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
+          const codexHome = environmentHome("CODEX_HOME");
           const codexSettings =
             config.value.homePath.trim().length === 0 &&
             config.value.shadowHomePath.trim().length === 0 &&
-            environmentHome?.trim()
-              ? { ...config.value, homePath: environmentHome }
+            codexHome?.trim()
+              ? { ...config.value, homePath: codexHome }
               : config.value;
           const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
             Effect.provideService(Path.Path, path),
@@ -1197,17 +1346,19 @@ export const make = Effect.gen(function* () {
           truncated = true;
           continue;
         }
-        const discovered = yield* source === "claudeAgent"
-          ? discoverClaudeTranscripts(home.homePath, home.providerInstanceId, operationBudget)
-          : discoverCodexTranscripts(home.homePath, home.providerInstanceId, operationBudget);
+        const discover =
+          source === "claudeAgent"
+            ? discoverClaudeTranscripts
+            : source === "codex"
+              ? discoverCodexTranscripts
+              : discoverPiTranscripts;
+        const discovered = yield* discover(home.homePath, home.providerInstanceId, operationBudget);
         truncated ||= discovered.truncated;
         if (supportedDiscovery) {
-          const environment = {
-            ...hostEnvironment,
-            ...Object.fromEntries(
-              (home.instance.environment ?? []).map((entry) => [entry.name, entry.value]),
-            ),
-          };
+          const environment = yield* mergeProviderInstanceEnvironment(
+            home.instance.environment,
+            hostEnvironment,
+          ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
           if (source === "claudeAgent") {
             const ids = yield* AgentSessionCatalog.listClaudeSessionIds(home.homePath).pipe(
               Effect.provideService(Path.Path, path),
@@ -1215,12 +1366,13 @@ export const make = Effect.gen(function* () {
               Effect.timeout("30 seconds"),
               Effect.option,
             );
-            if (Option.isSome(ids))
+            if (Option.isSome(ids)) {
+              truncated ||= ids.value.size >= MAX_TRANSCRIPTS_PER_SOURCE;
               discovered.transcripts = discovered.transcripts.filter((entry) =>
                 ids.value.has(path.basename(entry.filePath, ".jsonl")),
               );
-            else truncated = true;
-          } else {
+            } else truncated = true;
+          } else if (source === "codex") {
             const config = decodeCodexSettings(home.instance.config ?? {});
             const configuration: CodexCatalogConfiguration = {
               home: home.homePath,
@@ -1417,6 +1569,7 @@ export const make = Effect.gen(function* () {
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
     includeOlder = false,
+    candidateOverride?: ReadonlyArray<RawCandidate>,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1425,8 +1578,9 @@ export const make = Effect.gen(function* () {
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = includeOlder ? 0 : nowMs - RECENT_THREAD_WINDOW_MS;
 
-    const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
-    cachedCandidates = candidates;
+    const candidates =
+      candidateOverride ?? cachedCandidates ?? (yield* collectCandidates()).candidates;
+    if (candidateOverride === undefined) cachedCandidates = candidates;
 
     const eligibleTranscripts: Array<{
       readonly candidate: RawCandidate;
@@ -1573,6 +1727,46 @@ export const make = Effect.gen(function* () {
     includeOlder = false,
   ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, includeOlder));
 
+  const fallbackCandidates = (discovery: {
+    candidates: ReadonlyArray<RawCandidate>;
+    nativeCodexSessions: ReadonlyArray<NativeCodexSession>;
+  }) => {
+    const nativePaths = new Set(
+      discovery.nativeCodexSessions.flatMap((entry) =>
+        entry.session.path ? [`${entry.providerInstanceId}:${entry.session.path}`] : [],
+      ),
+    );
+    return discovery.candidates
+      .map((candidate) => ({
+        ...candidate,
+        transcripts: candidate.transcripts.filter(
+          (transcript) =>
+            !nativePaths.has(`${candidate.providerInstanceId}:${transcript.filePath}`),
+        ),
+      }))
+      .filter((candidate) => candidate.transcripts.length > 0);
+  };
+  const selectedCandidates = (
+    candidates: ReadonlyArray<RawCandidate>,
+    selections: ReadonlyArray<{
+      providerInstanceId: ProviderInstanceId;
+      providerSessionId: string;
+    }>,
+  ) => {
+    const matching = candidates
+      .map((candidate) => ({
+        ...candidate,
+        transcripts: candidate.transcripts.filter((transcript) =>
+          selections.some(
+            (selection) =>
+              selection.providerInstanceId === candidate.providerInstanceId &&
+              path.basename(transcript.filePath).includes(selection.providerSessionId),
+          ),
+        ),
+      }))
+      .filter((candidate) => candidate.transcripts.length > 0);
+    return matching.length > 0 ? matching : candidates;
+  };
   const nativeSessionsForRoot = Effect.fn("AgentSessionScanner.nativeSessionsForRoot")(function* (
     workspaceRoot: string,
     nativeCodexSessions: ReadonlyArray<NativeCodexSession>,
@@ -1595,6 +1789,7 @@ export const make = Effect.gen(function* () {
       .pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.timeout("30 seconds"),
+        importReadLock.withPermits(1),
       );
   });
   const selectedThreads: AgentSessionScanner["Service"]["selectedThreads"] = (
@@ -1604,7 +1799,6 @@ export const make = Effect.gen(function* () {
     Stream.unwrap(
       Effect.gen(function* () {
         const discovery = yield* collectCandidates(true);
-        cachedCandidates = discovery.candidates;
         const nativeEntries = yield* nativeSessionsForRoot(
           workspaceRoot,
           discovery.nativeCodexSessions,
@@ -1634,7 +1828,8 @@ export const make = Effect.gen(function* () {
                   providerInstanceId: entry.providerInstanceId,
                   providerSessionId: entry.session.id,
                   title: entry.session.title,
-                  model: null,
+                  model: entry.session.model ?? null,
+                  reasoningEffort: entry.session.reasoningEffort ?? null,
                   createdAt: entry.session.createdAt,
                   updatedAt: entry.session.updatedAt,
                   messages,
@@ -1644,7 +1839,22 @@ export const make = Effect.gen(function* () {
             ),
           ),
         );
-        const files = recentThreads(workspaceRoot, [], true).pipe(
+        const remaining = selections.filter(
+          (selection) =>
+            !nativeKeys.has(`${selection.providerInstanceId}:${selection.providerSessionId}`),
+        );
+        const files = (
+          remaining.length === 0
+            ? Stream.empty
+            : Stream.unwrap(
+                prepareRecentThreads(
+                  workspaceRoot,
+                  [],
+                  true,
+                  selectedCandidates(fallbackCandidates(discovery), remaining),
+                ),
+              )
+        ).pipe(
           Stream.filter(
             (outcome) =>
               outcome._tag !== "Skipped" &&
@@ -1668,6 +1878,7 @@ export const make = Effect.gen(function* () {
         at: number;
         result: AgentSessionBrowseResult;
         nativeEntries: ReadonlyArray<NativeCodexSession>;
+        fileCandidates: ReadonlyArray<RawCandidate>;
       }
     | undefined;
   const selectPreview = (
@@ -1688,13 +1899,51 @@ export const make = Effect.gen(function* () {
     result: AgentSessionBrowseResult,
     input: AgentSessionBrowseInput,
     nativeEntries: ReadonlyArray<NativeCodexSession>,
+    fileCandidates: ReadonlyArray<RawCandidate>,
+    workspaceRoot: string,
   ) {
     const entry = nativeEntries.find(
       (entry) =>
         entry.providerInstanceId === input.preview?.providerInstanceId &&
         entry.session.id === input.preview?.providerSessionId,
     );
-    if (!entry) return selectPreview(result, input);
+    if (!entry) {
+      if (!input.preview) return selectPreview(result, input);
+      const selection = input.preview;
+      const outcomes = yield* Stream.unwrap(
+        prepareRecentThreads(
+          workspaceRoot,
+          [],
+          true,
+          selectedCandidates(fileCandidates, [selection]),
+        ),
+      ).pipe(
+        Stream.filter(
+          (outcome) =>
+            outcome._tag === "Importable" &&
+            outcome.source.providerInstanceId === selection.providerInstanceId &&
+            outcome.source.providerSessionId === selection.providerSessionId,
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+      );
+      const outcome = outcomes[0];
+      return {
+        ...result,
+        sessions: result.sessions.map((session) => ({
+          ...session,
+          messages:
+            outcome?._tag === "Importable" &&
+            session.providerInstanceId === selection.providerInstanceId &&
+            session.providerSessionId === selection.providerSessionId
+              ? outcome.thread.messages.map((message, index) => ({
+                  ...message,
+                  id: `${selection.providerSessionId}:${index}`,
+                }))
+              : [],
+        })),
+      } satisfies AgentSessionBrowseResult;
+    }
     const history = yield* readNativeHistory(entry).pipe(Effect.result);
     return {
       ...selectPreview(result, input),
@@ -1723,19 +1972,48 @@ export const make = Effect.gen(function* () {
   const browse = Effect.fn("AgentSessionScanner.browse")(function* (
     input: AgentSessionBrowseInput,
   ) {
+    const projects = yield* projectStore
+      .listShells()
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const project = projects.find((project) => project.id === input.projectId);
+    if (!project)
+      return yield* new AgentSessionScanError({
+        operation: "read-projects",
+        cause: "Project does not exist",
+      });
+    const workspaceRoot = project.workspaceRoot;
     const now = DateTime.toEpochMillis(yield* DateTime.now);
     if (
       input.preview &&
-      browseCache?.workspaceRoot === input.workspaceRoot &&
+      browseCache?.workspaceRoot === workspaceRoot &&
       now - browseCache.at < 30_000
     ) {
-      return yield* withNativePreview(browseCache.result, input, browseCache.nativeEntries);
+      return yield* withNativePreview(
+        browseCache.result,
+        input,
+        browseCache.nativeEntries,
+        browseCache.fileCandidates,
+        workspaceRoot,
+      );
     }
     const discovery = yield* collectCandidates(true);
-    cachedCandidates = discovery.candidates;
-    const outcomes = yield* recentThreads(input.workspaceRoot, [], true).pipe(Stream.runCollect);
+    const fileCandidates = fallbackCandidates(discovery);
+    const outcomes = yield* Stream.unwrap(
+      prepareRecentThreads(workspaceRoot, [], true, fileCandidates),
+    ).pipe(
+      Stream.map((outcome) =>
+        outcome._tag === "Importable"
+          ? { ...outcome, thread: { ...outcome.thread, messages: [] } }
+          : outcome,
+      ),
+      Stream.runCollect,
+    );
     const nativeEntries = yield* nativeSessionsForRoot(
-      input.workspaceRoot,
+      workspaceRoot,
       discovery.nativeCodexSessions,
     );
     const nativeKeys = new Set(
@@ -1767,7 +2045,7 @@ export const make = Effect.gen(function* () {
               provider: thread.source,
               providerInstanceId: thread.providerInstanceId,
               providerSessionId: thread.providerSessionId,
-              workspaceRoot: input.workspaceRoot,
+              workspaceRoot: workspaceRoot,
               title: thread.title,
               updatedAt: thread.updatedAt,
               resumeLimitation:
@@ -1777,19 +2055,16 @@ export const make = Effect.gen(function* () {
                 )
                   ? "Claude requires a valid native session UUID to resume. This conversation can be added for viewing only."
                   : null,
-              messages: thread.messages.map((message, index) => ({
-                ...message,
-                id: `${thread.providerSessionId}:${index}`,
-              })),
+              messages: [],
             },
           ];
         }),
       ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
       limited: discovery.truncated || outcomes.some((outcome) => outcome._tag === "Skipped"),
     } satisfies AgentSessionBrowseResult;
-    browseCache = { workspaceRoot: input.workspaceRoot, at: now, result, nativeEntries };
-    return yield* withNativePreview(result, input, nativeEntries);
-  });
+    browseCache = { workspaceRoot, at: now, result, nativeEntries, fileCandidates };
+    return yield* withNativePreview(result, input, nativeEntries, fileCandidates, workspaceRoot);
+  }, browseLock.withPermits(1));
 
   return AgentSessionScanner.of({ scan, recentThreads, selectedThreads, browse });
 });

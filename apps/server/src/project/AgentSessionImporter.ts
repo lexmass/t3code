@@ -245,6 +245,11 @@ const make = Effect.gen(function* () {
             thread.source === "claudeAgent" &&
             !CLAUDE_SESSION_ID_PATTERN.test(thread.providerSessionId);
           const driver = ProviderDriverKind.make(thread.source);
+          // Pi resumes by session file path; its session UUID only names the thread.
+          const nativeThreadId =
+            thread.source === "pi" && "filePath" in source
+              ? source.filePath
+              : thread.providerSessionId;
           const persistRuntime = runtimes.upsert(
             {
               threadId,
@@ -255,9 +260,9 @@ const make = Effect.gen(function* () {
               status: "stopped",
               lastSeenAt: thread.updatedAt,
               resumeCursor:
-                thread.source === "codex"
-                  ? { threadId: thread.providerSessionId }
-                  : { threadId, resume: thread.providerSessionId },
+                thread.source === "claudeAgent"
+                  ? { threadId, resume: thread.providerSessionId }
+                  : { threadId: nativeThreadId },
               runtimePayload: { cwd: project.workspaceRoot },
             },
             { onConflict: "ignore" },
@@ -284,7 +289,7 @@ const make = Effect.gen(function* () {
           const providerThreadId = idAllocator.derive.providerThread({
             driver,
             providerInstanceId: thread.providerInstanceId,
-            nativeThreadId: thread.providerSessionId,
+            nativeThreadId,
           });
           const createdAt = dateTime(thread.createdAt);
           const updatedAt = dateTime(thread.updatedAt);
@@ -297,7 +302,13 @@ const make = Effect.gen(function* () {
               (thread.title.trim() === "" ? "Untitled thread" : thread.title) +
               (viewOnly ? " (view only: invalid Claude session ID)" : ""),
             providerInstanceId: thread.providerInstanceId,
-            modelSelection: { instanceId: thread.providerInstanceId, model },
+            modelSelection: {
+              instanceId: thread.providerInstanceId,
+              model,
+              ...(thread.reasoningEffort
+                ? { options: [{ id: "reasoningEffort", value: thread.reasoningEffort }] }
+                : {}),
+            },
             runtimeMode: DEFAULT_RUNTIME_MODE,
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
             branch: null,
@@ -335,8 +346,8 @@ const make = Effect.gen(function* () {
             ownerNodeId: null,
             nativeThreadRef: {
               driver,
-              nativeId: thread.providerSessionId,
-              strength: "strong",
+              nativeId: nativeThreadId,
+              strength: viewOnly ? "weak" : "strong",
             },
             nativeConversationHeadRef: null,
             status: "idle",

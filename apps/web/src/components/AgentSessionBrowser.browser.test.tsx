@@ -9,44 +9,47 @@ vi.mock(import("../state/use-atom-command"), () => ({
 }));
 vi.mock(import("../state/agentSessions"), async () => {
   const { Atom, AsyncResult } = await import("effect/reactivity");
+  const pending = Atom.make(AsyncResult.initial());
   const atoms = Atom.family((previewId: string) =>
-    Atom.make(
-      AsyncResult.success({
-        limited: false,
-        sessions: [
-          {
-            provider: "codex",
-            providerInstanceId: "codex",
-            providerSessionId: "native-id",
-            workspaceRoot: "/project",
-            title: "Resume compiler",
-            updatedAt: "2026-01-01T00:00:00Z",
-            resumeLimitation: null,
-            messages:
-              previewId === "native-id"
-                ? [
-                    {
-                      id: "m1",
-                      role: "assistant",
-                      text: "The previous compiler diagnosis",
-                      createdAt: "2026-01-01T00:00:00Z",
-                    },
-                  ]
-                : [],
-          },
-          {
-            provider: "claudeAgent",
-            providerInstanceId: "claudeAgent",
-            providerSessionId: "claude-id",
-            workspaceRoot: "/project",
-            title: "Claude planning",
-            updatedAt: "2026-01-01T00:00:00Z",
-            resumeLimitation: "Invalid native ID; view only",
-            messages: [],
-          },
-        ],
-      }),
-    ),
+    previewId === "claude-id"
+      ? pending
+      : Atom.make(
+          AsyncResult.success({
+            limited: false,
+            sessions: [
+              {
+                provider: "codex",
+                providerInstanceId: "codex",
+                providerSessionId: "native-id",
+                workspaceRoot: "/project",
+                title: "Resume compiler",
+                updatedAt: "2026-01-01T00:00:00Z",
+                resumeLimitation: null,
+                messages:
+                  previewId === "native-id"
+                    ? [
+                        {
+                          id: "m1",
+                          role: "assistant",
+                          text: "The previous compiler diagnosis",
+                          createdAt: "2026-01-01T00:00:00Z",
+                        },
+                      ]
+                    : [],
+              },
+              {
+                provider: "claudeAgent",
+                providerInstanceId: "claudeAgent",
+                providerSessionId: "claude-id",
+                workspaceRoot: "/project",
+                title: "Claude planning",
+                updatedAt: "2026-01-01T00:00:00Z",
+                resumeLimitation: "Invalid native ID; view only",
+                messages: [],
+              },
+            ],
+          }),
+        ),
   );
   const allowed = Atom.make(true);
   return {
@@ -89,4 +92,27 @@ it("previews existing history, searches sessions, and imports only the selected 
       sessions: [{ providerInstanceId: "codex", providerSessionId: "native-id" }],
     },
   });
+});
+
+it("keeps the session list visible while a selected preview is pending", async () => {
+  state.importSession.mockReset();
+  await using screen = await render(
+    <AgentSessionBrowser
+      project={
+        {
+          id: ProjectId.make("project"),
+          environmentId: EnvironmentId.make("primary"),
+          workspaceRoot: "/project",
+        } as never
+      }
+      onClose={() => {}}
+    />,
+  );
+  await screen.getByRole("button", { name: "Claude planning", exact: true }).click();
+  await expect
+    .element(screen.getByRole("button", { name: "Resume compiler", exact: true }))
+    .toBeVisible();
+  await expect
+    .element(screen.getByRole("button", { name: "Claude planning", exact: true }))
+    .toBeVisible();
 });

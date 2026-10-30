@@ -81,3 +81,25 @@ it("renders native paginated user and assistant history while retaining the firs
   expect(messages[1]?.text).toBe("Answer 11");
   expect(messages.at(-1)?.text).toBe("Answer 209");
 });
+
+it("bounds the first native request as well as the recent history", () => {
+  const messages = codexHistoryMessages({
+    createdAt: 1767225600,
+    turns: [
+      {
+        id: "large",
+        status: "completed",
+        items: [
+          {
+            type: "userMessage",
+            id: "first",
+            content: [{ type: "text", text: "x".repeat(17 * 1024 * 1024), text_elements: [] }],
+          },
+          { type: "agentMessage", id: "answer", text: "Latest answer" },
+        ],
+      },
+    ],
+  });
+  expect(messages[0]?.text.length).toBe(64 * 1024);
+  expect(messages.at(-1)?.text).toBe("Latest answer");
+});

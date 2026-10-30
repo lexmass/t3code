@@ -1168,7 +1168,9 @@ export const layer: Layer.Layer<
         }
         if (
           projection.thread.historyOrigin === "v1_import" &&
-          projection.thread.id.startsWith("import:")
+          projection.thread.id.startsWith("import:") &&
+          resumed._tag === "Failure" &&
+          !uncertainDelivery
         ) {
           return yield* loadFromProvider(
             Effect.fail(
@@ -1178,7 +1180,7 @@ export const layer: Layer.Layer<
                 providerThreadId: providerThread.id,
                 runId,
                 cause:
-                  "The original imported session could not be resumed. Its saved history remains available; check the provider installation, session storage, and workspace before retrying.",
+                  "The original imported session could not be resumed. Its saved history remains available; check the provider installation, session storage, and workspace before retrying, or start a new thread to continue separately.",
               }),
             ),
           );

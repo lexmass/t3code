@@ -1,4 +1,4 @@
-import { codexAppServerArgs, resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
+import { resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -8,7 +8,7 @@ import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import type * as CodexSchema from "effect-codex-app-server/schema";
-import * as CodexClient from "effect-codex-app-server/client";
+import { withCodexAppServerClient } from "../provider/CodexProvider.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 
@@ -64,20 +64,13 @@ export interface CodexCatalogConfiguration {
 const openCodexCatalog = Effect.fn("AgentSessionCatalog.openCodexCatalog")(function* (
   input: CodexCatalogConfiguration,
 ) {
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const handle = yield* spawner.spawn(
-    ChildProcess.make(
-      input.binary || "codex",
-      codexAppServerArgs(resolveCodexLaunchArgs(input.launchArgs, input.environment)),
-      {
-        env: { ...input.environment, CODEX_HOME: input.home },
-      },
-    ),
-  );
-  const context = yield* Layer.build(CodexClient.layerChildProcess(handle));
-  const client = Context.get(context, CodexClient.CodexAppServerClient);
-  yield* client.request("initialize", { clientInfo: { name: "t3-session-browser", version: "1" } });
-  yield* client.notify("initialized", undefined);
+  const { client } = yield* withCodexAppServerClient({
+    binaryPath: input.binary || "codex",
+    homePath: input.home,
+    launchArgs: resolveCodexLaunchArgs(input.launchArgs, input.environment),
+    environment: input.environment,
+    cwd: yield* HostProcess.WorkingDirectory,
+  });
   return client;
 });
 
@@ -107,6 +100,8 @@ export const listCodexSessions = Effect.fn("AgentSessionCatalog.listCodexSession
                 thread.preview.trim().split("\n")[0]?.slice(0, 100) ||
                 "Untitled Codex session",
               cwd: thread.cwd,
+              model: thread.model ?? null,
+              reasoningEffort: thread.reasoningEffort ?? null,
               path: thread.path ?? null,
               createdAt: DateTime.formatIso(DateTime.makeUnsafe(thread.createdAt * 1000)),
               updatedAt: DateTime.formatIso(DateTime.makeUnsafe(thread.updatedAt * 1000)),
@@ -125,6 +120,8 @@ export interface CodexCatalogSession {
   readonly id: string;
   readonly title: string;
   readonly cwd: string;
+  readonly model?: string | null;
+  readonly reasoningEffort?: string | null;
   readonly path: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -155,19 +152,28 @@ export function codexHistoryMessages(
             ? item.text
             : "";
       if (!text.trim()) continue;
+      const boundedText = text.slice(
+        0,
+        !firstUser && item.type === "userMessage" ? 64 * 1024 : 16 * 1024 * 1024,
+      );
       const message: CodexHistoryMessage = {
         role: item.type === "userMessage" ? "user" : "assistant",
-        text,
+        text: boundedText,
         createdAt,
       };
       if (!firstUser && message.role === "user") firstUser = message;
       messages.push(message);
-      bytes += text.length * 2;
+      bytes += boundedText.length * 2;
       while (messages.length > 200 || bytes > 32 * 1024 * 1024)
         bytes -= messages.shift()!.text.length * 2;
     }
   }
-  if (firstUser && !messages.includes(firstUser)) return [firstUser, ...messages.slice(-199)];
+  if (firstUser && !messages.includes(firstUser)) {
+    bytes += firstUser.text.length * 2;
+    while (messages.length >= 200 || bytes > 32 * 1024 * 1024)
+      bytes -= messages.shift()!.text.length * 2;
+    return [firstUser, ...messages];
+  }
   return messages;
 }
 
@@ -180,9 +186,32 @@ const readCodexSession = Effect.fn("AgentSessionCatalog.readCodexSession")(funct
       const client = yield* openCodexCatalog(input);
       const { thread } = yield* client.request("thread/read", {
         threadId: sessionId,
-        includeTurns: true,
+        includeTurns: false,
       });
-      return codexHistoryMessages(thread);
+      const first = yield* client.request("thread/turns/list", {
+        threadId: sessionId,
+        sortDirection: "asc",
+        itemsView: "summary",
+        limit: 1,
+      });
+      const recent: Array<CodexSchema.V2ThreadReadResponse["thread"]["turns"][number]> = [];
+      let cursor: string | undefined;
+      for (let pageCount = 0; pageCount < 20; pageCount++) {
+        const page = yield* client.request("thread/turns/list", {
+          threadId: sessionId,
+          sortDirection: "desc",
+          itemsView: "summary",
+          limit: 10,
+          ...(cursor ? { cursor } : {}),
+        });
+        recent.push(...page.data);
+        cursor = page.nextCursor ?? undefined;
+        if (!cursor || codexHistoryMessages({ ...thread, turns: recent }).length >= 200) break;
+      }
+      const turns = [
+        ...new Map([...first.data, ...recent.toReversed()].map((turn) => [turn.id, turn])).values(),
+      ];
+      return codexHistoryMessages({ ...thread, turns });
     }),
   );
 });
