@@ -1,7 +1,11 @@
+import * as AgentSessionCatalog from "./AgentSessionCatalog.ts";
+import type { CodexCatalogConfiguration, CodexCatalogSession } from "./AgentSessionCatalog.ts";
 import * as NodeOS from "node:os";
 
 import {
   AgentSessionScanError,
+  type AgentSessionBrowseInput,
+  type AgentSessionBrowseResult,
   ClaudeSettings,
   CodexSettings,
   ProviderDriverKind,
@@ -13,6 +17,7 @@ import {
   type AgentSessionScanResult,
   type ProviderInstanceConfig,
 } from "@t3tools/contracts";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -143,12 +148,22 @@ export interface AgentSessionThread {
   readonly providerSessionId: string;
   readonly title: string;
   readonly model: string | null;
+  readonly reasoningEffort?: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
 }
 
 export type AgentSessionRecentThread =
+  | {
+      readonly _tag: "NativeImportable";
+      readonly thread: AgentSessionThread;
+      readonly source: {
+        readonly provider: "codex";
+        readonly providerInstanceId: ProviderInstanceId;
+        readonly providerSessionId: string;
+      };
+    }
   | {
       readonly _tag: "Importable";
       readonly thread: AgentSessionThread;
@@ -162,9 +177,20 @@ export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
   {
     readonly scan: Effect.Effect<AgentSessionScanResult, AgentSessionScanError>;
+    readonly browse: (
+      input: AgentSessionBrowseInput,
+    ) => Effect.Effect<AgentSessionBrowseResult, AgentSessionScanError>;
+    readonly selectedThreads: (
+      workspaceRoot: string,
+      sessions: ReadonlyArray<{
+        readonly providerInstanceId: ProviderInstanceId;
+        readonly providerSessionId: string;
+      }>,
+    ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      includeOlder?: boolean,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
@@ -693,15 +719,21 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   // Concurrent client imports must not hold multiple selected-history budgets.
   const importReadLock = yield* Semaphore.make(1);
+  const browseLock = yield* Semaphore.make(1);
   const path = yield* Path.Path;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const codexCatalog = yield* AgentSessionCatalog.CodexSessionCatalog;
   const projectStore = yield* ProjectStore.ProjectStoreV2;
   const baseDir = path.resolve(serverConfig.baseDir);
   const worktreesDir = path.resolve(serverConfig.worktreesDir);
+  const realWorktreesDir = yield* fileSystem
+    .realPath(worktreesDir)
+    .pipe(Effect.orElseSucceed(() => worktreesDir));
   const foldWorktreeCase = (yield* HostProcess.Platform) === "win32";
   const hostEnvironment = yield* HostProcess.Environment;
   const homeDir = yield* HostProcess.HomeDirectory;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   // `/private/tmp` is what macOS reports for sessions started in `/tmp`.
   const excludedProjectRoots = new Set(
     [homeDir, NodeOS.tmpdir(), "/tmp", "/private/tmp"].map((directory) =>
@@ -723,7 +755,8 @@ export const make = Effect.gen(function* () {
     normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
       normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
     ) ||
-    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase);
+    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase) ||
+    isT3ManagedWorktree(candidatePath, realWorktreesDir, foldWorktreeCase);
 
   const listDirectory = (directory: string) =>
     fileSystem.readDirectory(directory).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
@@ -1208,11 +1241,20 @@ export const make = Effect.gen(function* () {
     }));
   });
 
-  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* () {
+  type NativeCodexSession = {
+    readonly session: CodexCatalogSession;
+    readonly configuration: CodexCatalogConfiguration;
+    readonly providerInstanceId: ProviderInstanceId;
+  };
+
+  const collectCandidates = Effect.fn("AgentSessionScanner.collectCandidates")(function* (
+    supportedDiscovery = false,
+  ) {
     const settings = yield* serverSettings.getSettings.pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-settings", cause })),
     );
 
+    const nativeCodexSessions: NativeCodexSession[] = [];
     const raw: Array<RawCandidate> = [];
     let truncated = false;
 
@@ -1243,7 +1285,11 @@ export const make = Effect.gen(function* () {
         const rightDefault = right.instanceId === source ? 0 : 1;
         return leftDefault - rightDefault;
       });
-      const homes: Array<{ homePath: string; providerInstanceId: ProviderInstanceId }> = [];
+      const homes: Array<{
+        homePath: string;
+        providerInstanceId: ProviderInstanceId;
+        instance: ProviderInstanceConfig;
+      }> = [];
       const seenHomes = new Set<string>();
       for (const { instanceId, config: instance } of instances) {
         const environmentHome = (name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME") => {
@@ -1286,7 +1332,7 @@ export const make = Effect.gen(function* () {
         const homeKey = `${source}\0${yield* directoryIdentity(homePath)}`;
         if (seenHomes.has(homeKey)) continue;
         seenHomes.add(homeKey);
-        homes.push({ homePath, providerInstanceId: instanceId });
+        homes.push({ homePath, providerInstanceId: instanceId, instance });
       }
 
       const transcriptCandidates: Array<TranscriptCandidate> = [];
@@ -1308,6 +1354,72 @@ export const make = Effect.gen(function* () {
               : discoverPiTranscripts;
         const discovered = yield* discover(home.homePath, home.providerInstanceId, operationBudget);
         truncated ||= discovered.truncated;
+        if (supportedDiscovery) {
+          const environment = yield* mergeProviderInstanceEnvironment(
+            home.instance.environment,
+            hostEnvironment,
+          ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
+          if (source === "claudeAgent") {
+            const ids = yield* AgentSessionCatalog.listClaudeSessionIds(home.homePath).pipe(
+              Effect.provideService(Path.Path, path),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.timeout("30 seconds"),
+              Effect.option,
+            );
+            if (Option.isSome(ids)) {
+              truncated ||= ids.value.size >= MAX_TRANSCRIPTS_PER_SOURCE;
+              discovered.transcripts = discovered.transcripts.filter((entry) =>
+                ids.value.has(path.basename(entry.filePath, ".jsonl")),
+              );
+            } else truncated = true;
+          } else if (source === "codex") {
+            const config = decodeCodexSettings(home.instance.config ?? {});
+            const configuration: CodexCatalogConfiguration = {
+              home: home.homePath,
+              binary: Option.isSome(config) ? config.value.binaryPath : "codex",
+              launchArgs: Option.isSome(config) ? config.value.launchArgs : "",
+              environment,
+            };
+            const catalog = yield* codexCatalog
+              .list(configuration)
+              .pipe(
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                Effect.timeout("30 seconds"),
+                Effect.option,
+              );
+            if (Option.isSome(catalog)) {
+              nativeCodexSessions.push(
+                ...catalog.value.map((session) => ({
+                  session,
+                  configuration,
+                  providerInstanceId: home.providerInstanceId,
+                })),
+              );
+              truncated ||= catalog.value.length >= MAX_TRANSCRIPTS_PER_SOURCE;
+              const nativeTranscripts = yield* Effect.forEach(
+                catalog.value.flatMap((session) => (session.path ? [session.path] : [])),
+                (filePath) =>
+                  statOption(filePath).pipe(
+                    Effect.map((stats) =>
+                      Option.isSome(stats) && stats.value.type === "File"
+                        ? [
+                            {
+                              filePath,
+                              mtimeMs: Option.isSome(stats.value.mtime)
+                                ? stats.value.mtime.value.getTime()
+                                : 0,
+                              size: Number(stats.value.size),
+                              providerInstanceId: home.providerInstanceId,
+                            },
+                          ]
+                        : [],
+                    ),
+                  ),
+              );
+              discovered.transcripts = nativeTranscripts.flat();
+            } else truncated = true;
+          }
+        }
         transcriptCandidates.push(...discovered.transcripts);
       }
 
@@ -1329,7 +1441,7 @@ export const make = Effect.gen(function* () {
       truncated ||= metadataBudget.truncated;
     }
 
-    return { candidates: raw, truncated };
+    return { candidates: raw, truncated, nativeCodexSessions };
   });
 
   let cachedCandidates: ReadonlyArray<RawCandidate> | null = null;
@@ -1456,16 +1568,19 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    includeOlder = false,
+    candidateOverride?: ReadonlyArray<RawCandidate>,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
+    const cutoffMs = includeOlder ? 0 : nowMs - RECENT_THREAD_WINDOW_MS;
 
-    const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
-    cachedCandidates = candidates;
+    const candidates =
+      candidateOverride ?? cachedCandidates ?? (yield* collectCandidates()).candidates;
+    if (candidateOverride === undefined) cachedCandidates = candidates;
 
     const eligibleTranscripts: Array<{
       readonly candidate: RawCandidate;
@@ -1609,9 +1724,379 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    includeOlder = false,
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, includeOlder));
 
-  return AgentSessionScanner.of({ scan, recentThreads });
+  const fallbackCandidates = (discovery: {
+    candidates: ReadonlyArray<RawCandidate>;
+    nativeCodexSessions: ReadonlyArray<NativeCodexSession>;
+  }) => {
+    const nativePaths = new Set(
+      discovery.nativeCodexSessions.flatMap((entry) =>
+        entry.session.path ? [`${entry.providerInstanceId}:${entry.session.path}`] : [],
+      ),
+    );
+    return discovery.candidates
+      .map((candidate) => ({
+        ...candidate,
+        transcripts: candidate.transcripts.filter(
+          (transcript) =>
+            !nativePaths.has(`${candidate.providerInstanceId}:${transcript.filePath}`),
+        ),
+      }))
+      .filter((candidate) => candidate.transcripts.length > 0);
+  };
+  const selectedCandidates = (
+    candidates: ReadonlyArray<RawCandidate>,
+    selections: ReadonlyArray<{
+      providerInstanceId: ProviderInstanceId;
+      providerSessionId: string;
+    }>,
+  ) => {
+    const matching = candidates
+      .map((candidate) => ({
+        ...candidate,
+        transcripts: candidate.transcripts.filter((transcript) =>
+          selections.some(
+            (selection) =>
+              selection.providerInstanceId === candidate.providerInstanceId &&
+              path.basename(transcript.filePath).includes(selection.providerSessionId),
+          ),
+        ),
+      }))
+      .filter((candidate) => candidate.transcripts.length > 0);
+    return matching.length > 0 ? matching : candidates;
+  };
+  const nativeSessionsForRoot = Effect.fn("AgentSessionScanner.nativeSessionsForRoot")(function* (
+    workspaceRoot: string,
+    nativeCodexSessions: ReadonlyArray<NativeCodexSession>,
+  ) {
+    const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
+    const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
+    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return [];
+    const identity = yield* directoryIdentity(root);
+    return yield* Effect.filter(nativeCodexSessions, (entry) =>
+      directoryIdentity(entry.session.cwd).pipe(
+        Effect.map((cwdIdentity) => cwdIdentity === identity),
+      ),
+    );
+  });
+  const readNativeHistory = Effect.fn("AgentSessionScanner.readNativeHistory")(function* (
+    entry: NativeCodexSession,
+  ) {
+    const history = yield* codexCatalog
+      .read(entry.configuration, entry.session.id)
+      .pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.timeout("30 seconds"),
+        importReadLock.withPermits(1),
+        Effect.result,
+      );
+    if (history._tag === "Success") return history.success;
+    const filePath = entry.session.path;
+    if (filePath?.endsWith(".jsonl")) {
+      const stats = yield* statOption(filePath);
+      const mtimeMs =
+        Option.isSome(stats) && Option.isSome(stats.value.mtime)
+          ? stats.value.mtime.value.getTime()
+          : null;
+      const fallback = yield* Stream.unwrap(
+        prepareRecentThreads(entry.session.cwd, [], true, [
+          {
+            cwd: entry.session.cwd,
+            source: "codex",
+            providerInstanceId: entry.providerInstanceId,
+            threadCount: 1,
+            lastActiveAtMs: null,
+            transcripts: [{ filePath, mtimeMs }],
+          },
+        ]),
+      ).pipe(Stream.runHead);
+      if (
+        Option.isSome(fallback) &&
+        fallback.value._tag === "Importable" &&
+        fallback.value.thread.providerSessionId === entry.session.id
+      ) {
+        return fallback.value.thread.messages;
+      }
+    }
+    return yield* history.failure;
+  });
+  const selectedThreads: AgentSessionScanner["Service"]["selectedThreads"] = (
+    workspaceRoot,
+    selections,
+  ) =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const discovery = yield* collectCandidates(true);
+        const nativeEntries = yield* nativeSessionsForRoot(
+          workspaceRoot,
+          discovery.nativeCodexSessions,
+        );
+        const selectedNativeEntries = nativeEntries.filter((entry) =>
+          selections.some(
+            (selection) =>
+              selection.providerInstanceId === entry.providerInstanceId &&
+              selection.providerSessionId === entry.session.id,
+          ),
+        );
+        const nativeKeys = new Set(
+          selectedNativeEntries.map((entry) => `${entry.providerInstanceId}:${entry.session.id}`),
+        );
+        const native = Stream.fromIterable(selectedNativeEntries).pipe(
+          Stream.mapEffect((entry) =>
+            readNativeHistory(entry).pipe(
+              Effect.map((messages): AgentSessionRecentThread => ({
+                _tag: "NativeImportable",
+                source: {
+                  provider: "codex",
+                  providerInstanceId: entry.providerInstanceId,
+                  providerSessionId: entry.session.id,
+                },
+                thread: {
+                  source: "codex",
+                  providerInstanceId: entry.providerInstanceId,
+                  providerSessionId: entry.session.id,
+                  title: entry.session.title,
+                  model: entry.session.model ?? null,
+                  reasoningEffort: entry.session.reasoningEffort ?? null,
+                  createdAt: entry.session.createdAt,
+                  updatedAt: entry.session.updatedAt,
+                  messages,
+                },
+              })),
+              Effect.orElseSucceed((): AgentSessionRecentThread => ({ _tag: "Skipped" })),
+            ),
+          ),
+        );
+        const remaining = selections.filter(
+          (selection) =>
+            !nativeKeys.has(`${selection.providerInstanceId}:${selection.providerSessionId}`),
+        );
+        const files = (
+          remaining.length === 0
+            ? Stream.empty
+            : Stream.unwrap(
+                prepareRecentThreads(
+                  workspaceRoot,
+                  [],
+                  true,
+                  selectedCandidates(fallbackCandidates(discovery), remaining),
+                ),
+              )
+        ).pipe(
+          Stream.filter(
+            (outcome) =>
+              outcome._tag !== "Skipped" &&
+              selections.some(
+                (selection) =>
+                  selection.providerInstanceId === outcome.source.providerInstanceId &&
+                  selection.providerSessionId === outcome.source.providerSessionId,
+              ) &&
+              !nativeKeys.has(
+                `${outcome.source.providerInstanceId}:${outcome.source.providerSessionId}`,
+              ),
+          ),
+        );
+        return Stream.concat(native, files);
+      }),
+    );
+
+  let browseCache:
+    | {
+        workspaceRoot: string;
+        at: number;
+        result: AgentSessionBrowseResult;
+        nativeEntries: ReadonlyArray<NativeCodexSession>;
+        fileCandidates: ReadonlyArray<RawCandidate>;
+      }
+    | undefined;
+  const selectPreview = (
+    result: AgentSessionBrowseResult,
+    input: AgentSessionBrowseInput,
+  ): AgentSessionBrowseResult => ({
+    ...result,
+    sessions: result.sessions.map((session) => ({
+      ...session,
+      messages:
+        input.preview?.providerInstanceId === session.providerInstanceId &&
+        input.preview.providerSessionId === session.providerSessionId
+          ? session.messages
+          : [],
+    })),
+  });
+  const withNativePreview = Effect.fn("AgentSessionScanner.withNativePreview")(function* (
+    result: AgentSessionBrowseResult,
+    input: AgentSessionBrowseInput,
+    nativeEntries: ReadonlyArray<NativeCodexSession>,
+    fileCandidates: ReadonlyArray<RawCandidate>,
+    workspaceRoot: string,
+  ) {
+    const entry = nativeEntries.find(
+      (entry) =>
+        entry.providerInstanceId === input.preview?.providerInstanceId &&
+        entry.session.id === input.preview?.providerSessionId,
+    );
+    if (!entry) {
+      if (!input.preview) return selectPreview(result, input);
+      const selection = input.preview;
+      const outcomes = yield* Stream.unwrap(
+        prepareRecentThreads(
+          workspaceRoot,
+          [],
+          true,
+          selectedCandidates(fileCandidates, [selection]),
+        ),
+      ).pipe(
+        Stream.filter(
+          (outcome) =>
+            outcome._tag === "Importable" &&
+            outcome.source.providerInstanceId === selection.providerInstanceId &&
+            outcome.source.providerSessionId === selection.providerSessionId,
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+      );
+      const outcome = outcomes[0];
+      return {
+        ...result,
+        sessions: result.sessions.map((session) => ({
+          ...session,
+          messages:
+            outcome?._tag === "Importable" &&
+            session.providerInstanceId === selection.providerInstanceId &&
+            session.providerSessionId === selection.providerSessionId
+              ? outcome.thread.messages.map((message, index) => ({
+                  ...message,
+                  id: `${selection.providerSessionId}:${index}`,
+                }))
+              : [],
+        })),
+      } satisfies AgentSessionBrowseResult;
+    }
+    const history = yield* readNativeHistory(entry).pipe(Effect.result);
+    return {
+      ...selectPreview(result, input),
+      sessions: result.sessions.map((session) => ({
+        ...session,
+        messages:
+          session.providerInstanceId === entry.providerInstanceId &&
+          session.providerSessionId === entry.session.id &&
+          history._tag === "Success"
+            ? history.success.map((message, index) => ({
+                ...message,
+                id: `${entry.session.id}:${index}`,
+              }))
+            : [],
+        ...(session.providerInstanceId === entry.providerInstanceId &&
+        session.providerSessionId === entry.session.id &&
+        history._tag === "Failure"
+          ? {
+              historyLimitation:
+                "Codex lists this session, but could not read its stored history. Check the configured Codex installation and storage.",
+            }
+          : {}),
+      })),
+    } satisfies AgentSessionBrowseResult;
+  });
+  const browse = Effect.fn("AgentSessionScanner.browse")(function* (
+    input: AgentSessionBrowseInput,
+  ) {
+    const projects = yield* projectStore
+      .listShells()
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const project = projects.find((project) => project.id === input.projectId);
+    if (!project)
+      return yield* new AgentSessionScanError({
+        operation: "read-projects",
+        cause: "Project does not exist",
+      });
+    const workspaceRoot = project.workspaceRoot;
+    const now = DateTime.toEpochMillis(yield* DateTime.now);
+    if (
+      input.preview &&
+      browseCache?.workspaceRoot === workspaceRoot &&
+      now - browseCache.at < 30_000
+    ) {
+      return yield* withNativePreview(
+        browseCache.result,
+        input,
+        browseCache.nativeEntries,
+        browseCache.fileCandidates,
+        workspaceRoot,
+      );
+    }
+    const discovery = yield* collectCandidates(true);
+    const fileCandidates = fallbackCandidates(discovery);
+    const outcomes = yield* Stream.unwrap(
+      prepareRecentThreads(workspaceRoot, [], true, fileCandidates),
+    ).pipe(
+      Stream.map((outcome) =>
+        outcome._tag === "Importable"
+          ? { ...outcome, thread: { ...outcome.thread, messages: [] } }
+          : outcome,
+      ),
+      Stream.runCollect,
+    );
+    const nativeEntries = yield* nativeSessionsForRoot(
+      workspaceRoot,
+      discovery.nativeCodexSessions,
+    );
+    const nativeKeys = new Set(
+      nativeEntries.map((entry) => `${entry.providerInstanceId}:${entry.session.id}`),
+    );
+    const result = {
+      sessions: [
+        ...nativeEntries.map((entry) => ({
+          provider: "codex" as const,
+          providerInstanceId: entry.providerInstanceId,
+          providerSessionId: entry.session.id,
+          workspaceRoot: entry.session.cwd,
+          title: entry.session.title,
+          updatedAt: entry.session.updatedAt,
+          resumeLimitation: null,
+          messages: [],
+        })),
+        ...outcomes.flatMap((outcome) => {
+          if (
+            outcome._tag !== "Importable" ||
+            nativeKeys.has(
+              `${outcome.source.providerInstanceId}:${outcome.source.providerSessionId}`,
+            )
+          )
+            return [];
+          const thread = outcome.thread;
+          return [
+            {
+              provider: thread.source,
+              providerInstanceId: thread.providerInstanceId,
+              providerSessionId: thread.providerSessionId,
+              workspaceRoot: workspaceRoot,
+              title: thread.title,
+              updatedAt: thread.updatedAt,
+              resumeLimitation:
+                thread.source === "claudeAgent" &&
+                !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+                  thread.providerSessionId,
+                )
+                  ? "Claude requires a valid native session UUID to resume. This conversation can be added for viewing only."
+                  : null,
+              messages: [],
+            },
+          ];
+        }),
+      ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+      limited: discovery.truncated || outcomes.some((outcome) => outcome._tag === "Skipped"),
+    } satisfies AgentSessionBrowseResult;
+    browseCache = { workspaceRoot, at: now, result, nativeEntries, fileCandidates };
+    return yield* withNativePreview(result, input, nativeEntries, fileCandidates, workspaceRoot);
+  }, browseLock.withPermits(1));
+
+  return AgentSessionScanner.of({ scan, recentThreads, selectedThreads, browse });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make);

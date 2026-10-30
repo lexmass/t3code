@@ -943,9 +943,13 @@ export function shouldPrepareLegacyImportHandoff(input: {
   readonly hasCompletedRun: boolean;
   readonly historyOrigin: OrchestrationV2AppThread["historyOrigin"];
   readonly legacyImportItemCount: number;
+  readonly hasNativeContext?: boolean;
 }): boolean {
   return (
-    input.historyOrigin === "v1_import" && !input.hasCompletedRun && input.legacyImportItemCount > 0
+    input.historyOrigin === "v1_import" &&
+    !input.hasNativeContext &&
+    !input.hasCompletedRun &&
+    input.legacyImportItemCount > 0
   );
 }
 
@@ -5613,6 +5617,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const activeProviderThread = projection.providerThreads.find(
       (candidate) => candidate.id === projection.thread.activeProviderThreadId,
     );
+    if (
+      projection.thread.id.startsWith("import:") &&
+      activeProviderThread?.nativeThreadRef?.strength === "weak" &&
+      activeProviderThread.providerInstanceId === modelSelection.instanceId
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause:
+          "This imported conversation is view only because it has no resumable native session ID. Start a new thread to continue.",
+      });
+    }
     const activeRun = projection.runs.find(isBlockingRun);
     // A message queued during worktree setup can arrive after that setup failed
     // without a worktree. It waits, held, like the messages queued before the
@@ -6056,6 +6072,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         historyOrigin: projection.thread.historyOrigin,
         hasCompletedRun: latestCompletedRun !== undefined,
         legacyImportItemCount: legacyImportItems.length,
+        hasNativeContext: activeProviderThread?.nativeThreadRef?.strength === "strong",
       })
         ? yield* contextHandoffService
             .prepareLegacyImport({

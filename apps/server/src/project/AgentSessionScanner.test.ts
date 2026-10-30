@@ -1,3 +1,4 @@
+import * as AgentSessionCatalog from "./AgentSessionCatalog.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
 import { describe, expect, it } from "@effect/vitest";
@@ -44,6 +45,7 @@ const layerProjectStore = (importedWorkspaceRoots: ReadonlyArray<string>) =>
   });
 
 interface ScannerTestInput {
+  readonly codexCatalog?: AgentSessionCatalog.CodexSessionCatalog["Service"];
   readonly claudeHomePath: string;
   readonly codexHomePath: string;
   readonly piAgentDir?: string;
@@ -54,6 +56,11 @@ interface ScannerTestInput {
 
 const layerScannerTest = (input: ScannerTestInput) =>
   AgentSessionScanner.layer.pipe(
+    Layer.provide(
+      input.codexCatalog
+        ? Layer.succeed(AgentSessionCatalog.CodexSessionCatalog, input.codexCatalog)
+        : AgentSessionCatalog.layer,
+    ),
     Layer.provide(
       Layer.mergeAll(
         ServerSettings.layerTest({
@@ -98,16 +105,20 @@ const runScan = (input: ScannerTestInput) =>
     return yield* scanner.scan;
   }).pipe(Effect.provide(layerScannerTest(input)));
 
-const runRecentThreadOutcomes = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
+const runRecentThreadOutcomes = (
+  input: ScannerTestInput & { readonly workspaceRoot: string; readonly includeOlder?: boolean },
+) =>
   Effect.gen(function* () {
     const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-    return yield* scanner.recentThreads(input.workspaceRoot).pipe(
+    return yield* scanner.recentThreads(input.workspaceRoot, [], input.includeOlder).pipe(
       Stream.runCollect,
       Effect.map((outcomes) => Array.from(outcomes)),
     );
   }).pipe(Effect.provide(layerScannerTest(input)));
 
-const runRecentThreads = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
+const runRecentThreads = (
+  input: ScannerTestInput & { readonly workspaceRoot: string; readonly includeOlder?: boolean },
+) =>
   runRecentThreadOutcomes(input).pipe(
     Effect.map((outcomes) =>
       outcomes.flatMap((outcome) => (outcome._tag === "Importable" ? [outcome.thread] : [])),
@@ -248,7 +259,237 @@ const makeFileIdentityFixture = Effect.fn("AgentSessionScanner.test.makeFileIden
   },
 );
 
+it.live(
+  "lists metadata separately from conversation previews using the configured Claude catalog",
+  () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const claudeHomePath = yield* makeTempDir("t3-browse-claude-");
+      const codexHomePath = yield* makeTempDir("t3-browse-codex-");
+      const workspace = yield* makeTempDir("t3-browse-workspace-");
+      const id = "020e7f00-dce6-406b-8ec6-ed90498945d6";
+      const contents =
+        [
+          {
+            type: "user",
+            sessionId: id,
+            uuid: id,
+            cwd: workspace,
+            message: { role: "user", content: "A conversation to find" },
+          },
+          {
+            type: "assistant",
+            sessionId: id,
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Existing response" }],
+            },
+          },
+        ]
+          .map((record) => JSON.stringify(record))
+          .join("\n") + "\n";
+      const filePath = path.join(claudeHomePath, "projects", "-project", `${id}.jsonl`);
+      yield* writeTranscript({ filePath, contents, mtimeMs: Date.parse("2026-01-01T00:00:00Z") });
+      yield* Effect.gen(function* () {
+        const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+        const listing = yield* scanner.browse({ projectId: ProjectId.make("project-1") });
+        expect(listing.sessions).toMatchObject([
+          {
+            provider: "claudeAgent",
+            providerSessionId: id,
+            messages: [],
+            resumeLimitation: null,
+          },
+        ]);
+        const preview = yield* scanner.browse({
+          projectId: ProjectId.make("project-1"),
+          preview: {
+            providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+            providerSessionId: id,
+          },
+        });
+        expect(preview.sessions[0]?.messages.map((message) => message.text)).toEqual([
+          "A conversation to find",
+          "Existing response",
+        ]);
+        expect(new Set(preview.sessions[0]?.messages.map((message) => message.id)).size).toBe(2);
+        const fs = yield* FileSystem.FileSystem;
+        expect(yield* fs.readFileString(filePath)).toBe(contents);
+      }).pipe(
+        Effect.provide(
+          layerScannerTest({
+            claudeHomePath,
+            codexHomePath,
+            importedWorkspaceRoots: [workspace],
+            providerInstances: {
+              [ProviderInstanceId.make("codex")]: {
+                driver: ProviderDriverKind.make("codex"),
+                enabled: false,
+              },
+            },
+          }),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+  it.effect(
+    "lists and imports Codex native histories whose JSONL files have been migrated, and explains unreadable history",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const claudeHomePath = yield* makeTempDir("t3-native-claude-");
+        const codexHomePath = yield* makeTempDir("t3-native-codex-");
+        const workspace = yield* makeTempDir("t3-native-workspace-");
+        const filePath = path.join(codexHomePath, "missing-rollout.jsonl");
+        yield* fs.writeFileString(`${filePath}.zst`, "preserved compressed original");
+        const base = {
+          model: "original-codex-model",
+          reasoningEffort: "xhigh",
+          title: "Start project2",
+          cwd: workspace,
+          path: filePath,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-02-01T00:00:00.000Z",
+        };
+        const native = { ...base, id: "migrated-native" };
+        const unreadable = { ...base, title: "Unreadable session", id: "unreadable-native" };
+        const fallbackPath = path.join(codexHomePath, "sessions", "fallback-native.jsonl");
+        const fallbackText =
+          [
+            { type: "session_meta", payload: { id: "fallback-native", cwd: workspace } },
+            {
+              type: "event_msg",
+              payload: { type: "user_message", message: "File fallback prompt" },
+            },
+          ]
+            .map((record) => encodeTranscriptRecord(record))
+            .join("\n") + "\n";
+        yield* writeTranscript({ filePath: fallbackPath, contents: fallbackText, mtimeMs: 0 });
+        const fallback = {
+          ...base,
+          title: "Fallback session",
+          id: "fallback-native",
+          path: fallbackPath,
+        };
+        const reads: string[] = [];
+        const messages = [
+          { role: "user" as const, text: "Original prompt", createdAt: base.createdAt },
+          { role: "assistant" as const, text: "Original response", createdAt: base.updatedAt },
+        ];
+        const catalog = AgentSessionCatalog.CodexSessionCatalog.of({
+          list: () => Effect.succeed([native, unreadable, fallback]),
+          read: (_configuration, id) => {
+            reads.push(id);
+            return id === unreadable.id || id === fallback.id
+              ? Effect.fail(
+                  new AgentSessionCatalog.AgentSessionCatalogError({
+                    detail: "History unavailable",
+                  }),
+                )
+              : Effect.succeed(messages);
+          },
+        });
+        yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          const denied = yield* scanner
+            .browse({ projectId: ProjectId.make("missing-project") })
+            .pipe(Effect.result);
+          expect(denied).toMatchObject({
+            _tag: "Failure",
+            failure: { _tag: "AgentSessionScanError", operation: "read-projects" },
+          });
+          const listing = yield* scanner.browse({ projectId: ProjectId.make("project-1") });
+          expect(listing.sessions.map((session) => session.title)).toEqual([
+            "Start project2",
+            "Unreadable session",
+            "Fallback session",
+          ]);
+          expect(listing.sessions.every((session) => session.messages.length === 0)).toBe(true);
+          expect(reads).toEqual([]);
+          const selected = {
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerSessionId: native.id,
+          };
+          const preview = yield* scanner.browse({
+            projectId: ProjectId.make("project-1"),
+            preview: selected,
+          });
+          expect(preview.sessions[0]?.messages.map((message) => message.text)).toEqual([
+            "Original prompt",
+            "Original response",
+          ]);
+          const outcomes = yield* scanner
+            .selectedThreads(workspace, [selected])
+            .pipe(Stream.runCollect);
+          expect(outcomes).toMatchObject([
+            {
+              _tag: "NativeImportable",
+              source: { providerSessionId: native.id },
+              thread: { messages, model: "original-codex-model", reasoningEffort: "xhigh" },
+            },
+          ]);
+          const failure = yield* scanner.browse({
+            projectId: ProjectId.make("project-1"),
+            preview: { ...selected, providerSessionId: unreadable.id },
+          });
+          expect(
+            failure.sessions.find((session) => session.providerSessionId === unreadable.id)
+              ?.historyLimitation,
+          ).toContain("could not read");
+          expect(
+            yield* scanner
+              .selectedThreads(workspace, [{ ...selected, providerSessionId: unreadable.id }])
+              .pipe(Stream.runCollect),
+          ).toEqual([{ _tag: "Skipped" }]);
+          expect(yield* fs.exists(filePath)).toBe(false);
+          const fallbackSelection = { ...selected, providerSessionId: fallback.id };
+          const fallbackPreview = yield* scanner.browse({
+            projectId: ProjectId.make("project-1"),
+            preview: fallbackSelection,
+          });
+          expect(
+            fallbackPreview.sessions.find((session) => session.providerSessionId === fallback.id),
+          ).toMatchObject({
+            messages: [{ text: "File fallback prompt" }],
+          });
+          const fallbackImport = yield* scanner
+            .selectedThreads(workspace, [fallbackSelection])
+            .pipe(Stream.runCollect);
+          expect(fallbackImport).toMatchObject([
+            {
+              _tag: "NativeImportable",
+              source: { providerSessionId: fallback.id },
+              thread: {
+                messages: [{ text: "File fallback prompt" }],
+                model: "original-codex-model",
+                reasoningEffort: "xhigh",
+              },
+            },
+          ]);
+          expect(yield* fs.readFileString(fallbackPath)).toBe(fallbackText);
+          expect(yield* fs.readFileString(`${filePath}.zst`)).toBe("preserved compressed original");
+        }).pipe(
+          Effect.provide(
+            layerScannerTest({
+              claudeHomePath,
+              codexHomePath,
+              codexCatalog: catalog,
+              importedWorkspaceRoots: [workspace],
+              providerInstances: {
+                [ProviderInstanceId.make("claudeAgent")]: {
+                  driver: ProviderDriverKind.make("claudeAgent"),
+                  enabled: false,
+                },
+              },
+            }),
+          ),
+        );
+      }),
+  );
+
   describe("scan", () => {
     it.effect("reads Claude project cwds from transcripts, newest first", () =>
       Effect.gen(function* () {
@@ -1199,6 +1440,20 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           ["Review this code", "Looks good"],
           ["Fix the project", "Done"],
           ["Legacy prompt", "Legacy answer"],
+        ]);
+        const allThreads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          piAgentDir,
+          workspaceRoot: workspace,
+          includeOlder: true,
+        });
+        expect(allThreads.map((thread) => thread.providerSessionId)).toEqual([
+          "pi-recent",
+          "codex-recent",
+          "claude-recent",
+          "pi-v1",
+          "claude-old",
         ]);
         expect(threads[0]).toMatchObject({ source: "pi", title: "Pi refactor" });
       }),

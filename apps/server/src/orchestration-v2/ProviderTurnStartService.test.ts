@@ -3,6 +3,7 @@ import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  ContextHandoffId,
   GitCommandError,
   MessageId,
   NodeId,
@@ -15,6 +16,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
   ProjectId,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
@@ -274,6 +276,7 @@ function makeLocalCommandHarness(input: {
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly importedHistory?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -288,7 +291,11 @@ function makeLocalCommandHarness(input: {
   };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
-  const threadId = ThreadId.make("thread-native-account-command");
+  const threadId = ThreadId.make(
+    input.importedHistory
+      ? "import:codex-personal:native-resume-thread"
+      : "thread-native-account-command",
+  );
   const runId = RunId.make("run-native-account-command");
   const rootNodeId = NodeId.make("root-native-account-command");
   const attemptId = RunAttemptId.make("attempt-native-account-command");
@@ -352,6 +359,7 @@ function makeLocalCommandHarness(input: {
       id: threadId,
       activeProviderThreadId: providerThreadId,
       projectId: ProjectId.make("project-native-account-command"),
+      ...(input.importedHistory ? { historyOrigin: "v1_import" as const } : {}),
       branch: input.worktreePath === undefined ? null : "feature/restore",
       worktreePath: input.worktreePath ?? null,
     } as OrchestrationV2ThreadProjection["thread"],
@@ -690,13 +698,33 @@ function makeLocalCommandHarness(input: {
       ),
     }),
   );
+  const getTurnStartHistory = vi.fn<ProjectionStore.ProjectionStoreV2Shape["getTurnStartHistory"]>(
+    () =>
+      Effect.fail(
+        new ProjectionStore.ProjectionStoreReadError({
+          threadId,
+          cause: input.historyReadFailureAfterFallback,
+        }),
+      ),
+  );
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent,
+          write: ({ events: incoming }) =>
+            Effect.sync(() => {
+              for (const event of incoming) {
+                expect(isDomainEvent(event)).toBe(true);
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
+              return [];
+            }),
+        }),
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
@@ -727,13 +755,7 @@ function makeLocalCommandHarness(input: {
                   (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
               ),
             }),
-          getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+          getTurnStartHistory,
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
           open,
@@ -759,6 +781,7 @@ function makeLocalCommandHarness(input: {
   return {
     getThreadRecords,
     getTurnStartContext,
+    getTurnStartHistory,
     setProjection: (next: OrchestrationV2ThreadProjection) => {
       projection = next;
     },
@@ -1445,3 +1468,182 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "keeps imported history viewable when native resume fails without creating a replacement",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        importedHistory: true,
+        historyReadFailureAfterFallback: "not used",
+      });
+      yield* harness.start;
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      expect(harness.projection().providerThreads[0]?.nativeThreadRef?.nativeId).toBe(
+        "native-resume-thread",
+      );
+      expect(JSON.stringify(harness.projection().turnItems)).toContain(
+        "original imported session could not be resumed",
+      );
+    }),
+);
+
+effectIt.effect.each(["uncertain", "budget", "legacy-ready", "legacy-pending"] as const)(
+  "preserves imported native context with %s handoff state",
+  (scenario) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue", importedHistory: true });
+      const projection = harness.projection();
+      const original = projection.providerThreads[0]!;
+      const nativeThreadRef = {
+        driver: original.driver,
+        nativeId: "native-resume-thread",
+        strength: "strong" as const,
+      };
+      const providerThread = {
+        ...original,
+        nativeThreadRef,
+        ...(scenario === "budget"
+          ? { contextUsage: { usedTokens: 100_000, maxTokens: 100_000 } }
+          : {}),
+      };
+      const run = projection.runs.at(-1)!;
+      const now = projection.updatedAt;
+      const retry = {
+        id: ContextHandoffId.make("retry-handoff"),
+        threadId: projection.thread.id,
+        targetRunId: run.id,
+        transferId: null,
+        fromProviderThreadIds: [providerThread.id],
+        toProviderThreadId: providerThread.id,
+        coveredRunOrdinals: { from: 1, to: 1 },
+        strategy: "delta_since_target_last_seen" as const,
+        status: "ready" as const,
+        summaryMessageId: null,
+        summaryText: "Unsent retry request",
+        history: {
+          messages: [
+            {
+              itemId: TurnItemId.make("retry-item"),
+              role: "user" as const,
+              text: "Unsent retry request",
+              threadId: projection.thread.id,
+              runId: null,
+              providerThreadId: providerThread.id,
+              status: "completed",
+              kind: "user_message",
+            },
+          ],
+          coverage: "Retry request",
+          omittedItems: 0,
+        },
+        createdByProviderInstanceId: null,
+        createdAt: now,
+        updatedAt: now,
+        ...(scenario === "uncertain"
+          ? {
+              delivery: {
+                nativeThreadId: nativeThreadRef.nativeId,
+                status: "pending" as const,
+                itemIds: [],
+              },
+            }
+          : {}),
+      };
+      const legacy = {
+        ...retry,
+        id: ContextHandoffId.make("obsolete-legacy-handoff"),
+        fromProviderThreadIds: [],
+        strategy: "manual_context" as const,
+        summaryText: "Original imported transcript",
+        history: {
+          ...retry.history,
+          messages: [
+            {
+              ...retry.history.messages[0]!,
+              itemId: TurnItemId.make("imported-item"),
+              text: "Original imported transcript",
+            },
+          ],
+        },
+        ...(scenario === "legacy-pending"
+          ? {
+              delivery: {
+                nativeThreadId: nativeThreadRef.nativeId,
+                status: "pending" as const,
+                itemIds: [],
+              },
+            }
+          : {}),
+      };
+      harness.setProjection({
+        ...projection,
+        providerThreads: [providerThread],
+        contextHandoffs: scenario.startsWith("legacy") ? [legacy, retry] : [retry],
+      });
+      harness.getTurnStartHistory.mockImplementation(() => Effect.succeed([]));
+      const ensureThread = vi.fn(() =>
+        Effect.succeed({
+          ...providerThread,
+          nativeThreadRef: { ...nativeThreadRef, nativeId: "replacement" },
+        }),
+      );
+      const resumeThread = vi.fn(() => Effect.succeed(providerThread));
+      const startTurn = vi.fn(() => Effect.void);
+      harness.open.mockImplementation(() =>
+        Effect.succeed({
+          driver: original.driver,
+          providerSession: {
+            id: original.providerSessionId!,
+            driver: original.driver,
+            providerInstanceId: original.providerInstanceId,
+            status: "ready",
+            cwd: "/tmp/native-account-command",
+            model: null,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: now,
+            updatedAt: now,
+            lastError: null,
+          },
+          ensureThread,
+          resumeThread,
+          startTurn,
+        } as never),
+      );
+      harness.startRootRun.mockImplementation((request) =>
+        request.session
+          .startTurn({
+            ...request,
+            threadId: request.appThread.id,
+            runId: request.run.id,
+            runOrdinal: request.run.ordinal,
+            rootNodeId: request.rootNode.id,
+          })
+          .pipe(Effect.orDie),
+      );
+
+      yield* harness.start;
+
+      expect(ensureThread).not.toHaveBeenCalled();
+      expect(harness.projection().providerThreads[0]?.nativeThreadRef).toEqual(nativeThreadRef);
+      if (scenario.startsWith("legacy")) {
+        expect(harness.projection().runs.at(-1)?.status).toBe("running");
+        expect(startTurn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            message: expect.objectContaining({
+              text: expect.stringContaining("Unsent retry request"),
+            }),
+          }),
+        );
+        expect(JSON.stringify(startTurn.mock.calls)).not.toContain("Original imported transcript");
+      } else {
+        expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+        expect(harness.startRootRun).not.toHaveBeenCalled();
+        expect(JSON.stringify(harness.projection().turnItems)).toContain(
+          "original imported session",
+        );
+      }
+    }),
+);

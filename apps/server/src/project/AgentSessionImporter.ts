@@ -7,7 +7,6 @@ import {
   AgentSessionImportProjectNotFoundError,
   AgentSessionImportSource,
   AgentSessionScanError,
-  AgentSessionSource,
   EventId,
   MessageId,
   ProjectId,
@@ -47,18 +46,6 @@ const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
     importedTranscripts: Schema.optional(Schema.Array(AgentSessionImportSource)),
   }),
 );
-
-class AgentSessionUnresumableSessionError extends Schema.TaggedError<AgentSessionUnresumableSessionError>()(
-  "AgentSessionUnresumableSessionError",
-  {
-    source: AgentSessionSource,
-    providerSessionId: Schema.String,
-  },
-) {
-  override get message(): string {
-    return `Session '${this.providerSessionId}' from '${this.source}' cannot be resumed.`;
-  }
-}
 
 class AgentSessionThreadProjectConflictError extends Schema.TaggedError<AgentSessionThreadProjectConflictError>()(
   "AgentSessionThreadProjectConflictError",
@@ -211,7 +198,10 @@ const make = Effect.gen(function* () {
       }
       return payload.value.importedTranscripts ?? [];
     });
-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
+    const outcomes =
+      input.sessions === undefined
+        ? scanner.recentThreads(project.workspaceRoot, completedSources)
+        : scanner.selectedThreads(project.workspaceRoot, input.sessions);
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
     let skippedCount = 0;
@@ -223,6 +213,15 @@ const make = Effect.gen(function* () {
           return;
         }
         const source = outcome.source;
+        if (
+          input.sessions !== undefined &&
+          !input.sessions.some(
+            (session) =>
+              session.providerInstanceId === source.providerInstanceId &&
+              session.providerSessionId === source.providerSessionId,
+          )
+        )
+          return;
         const threadId = ThreadId.make(
           `import:${source.providerInstanceId}:${source.providerSessionId}`,
         );
@@ -233,26 +232,24 @@ const make = Effect.gen(function* () {
         }
         if (outcome._tag === "Duplicate") {
           if (importedThreadIds.has(threadId)) {
-            yield* runtimes.recordImportedTranscript({ threadId, source }).pipe(Effect.ignore);
+            yield* runtimes
+              .recordImportedTranscript({ threadId, source: outcome.source })
+              .pipe(Effect.ignore);
           }
           return;
         }
 
         const imported = yield* Effect.gen(function* () {
           const thread = outcome.thread;
-          if (
+          const viewOnly =
             thread.source === "claudeAgent" &&
-            !CLAUDE_SESSION_ID_PATTERN.test(thread.providerSessionId)
-          ) {
-            return yield* new AgentSessionUnresumableSessionError({
-              source: thread.source,
-              providerSessionId: thread.providerSessionId,
-            });
-          }
+            !CLAUDE_SESSION_ID_PATTERN.test(thread.providerSessionId);
           const driver = ProviderDriverKind.make(thread.source);
           // Pi resumes by session file path; its session UUID only names the thread.
           const nativeThreadId =
-            thread.source === "pi" ? source.filePath : thread.providerSessionId;
+            thread.source === "pi" && "filePath" in source
+              ? source.filePath
+              : thread.providerSessionId;
           const persistRuntime = runtimes.upsert(
             {
               threadId,
@@ -283,7 +280,8 @@ const make = Effect.gen(function* () {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
             yield* persistRuntime;
-            yield* runtimes.recordImportedTranscript({ threadId, source });
+            if ("filePath" in source)
+              yield* runtimes.recordImportedTranscript({ threadId, source });
             return true;
           }
 
@@ -300,9 +298,17 @@ const make = Effect.gen(function* () {
             creationSource: "server",
             id: threadId,
             projectId: input.projectId,
-            title: thread.title.trim() === "" ? "Untitled thread" : thread.title,
+            title:
+              (thread.title.trim() === "" ? "Untitled thread" : thread.title) +
+              (viewOnly ? " (view only: invalid Claude session ID)" : ""),
             providerInstanceId: thread.providerInstanceId,
-            modelSelection: { instanceId: thread.providerInstanceId, model },
+            modelSelection: {
+              instanceId: thread.providerInstanceId,
+              model,
+              ...(thread.reasoningEffort
+                ? { options: [{ id: "reasoningEffort", value: thread.reasoningEffort }] }
+                : {}),
+            },
             runtimeMode: DEFAULT_RUNTIME_MODE,
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
             branch: null,
@@ -341,7 +347,7 @@ const make = Effect.gen(function* () {
             nativeThreadRef: {
               driver,
               nativeId: nativeThreadId,
-              strength: "strong",
+              strength: viewOnly ? "weak" : "strong",
             },
             nativeConversationHeadRef: null,
             status: "idle",
@@ -381,7 +387,7 @@ const make = Effect.gen(function* () {
           });
           if (committed.length === 0) return null;
           yield* persistRuntime;
-          yield* runtimes.recordImportedTranscript({ threadId, source });
+          if ("filePath" in source) yield* runtimes.recordImportedTranscript({ threadId, source });
           return true;
         }).pipe(
           Effect.catch((cause) =>
