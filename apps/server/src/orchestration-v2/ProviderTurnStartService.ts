@@ -1166,6 +1166,23 @@ export const layer: Layer.Layer<
             );
           }
         }
+        if (
+          projection.thread.historyOrigin === "v1_import" &&
+          projection.thread.id.startsWith("import:")
+        ) {
+          return yield* loadFromProvider(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: projection.thread.id,
+                providerThreadId: providerThread.id,
+                runId,
+                cause:
+                  "The original imported session could not be resumed. Its saved history remains available; check the provider installation, session storage, and workspace before retrying.",
+              }),
+            ),
+          );
+        }
         resumedHandoffContext = undefined;
         resumedRetryHandoff = [];
         if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;

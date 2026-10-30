@@ -1,3 +1,4 @@
+import { AgentSessionBrowser } from "./AgentSessionBrowser";
 import { attachSidebarTree, SIDEBAR_TREE_PROPS } from "../lib/sidebarTree";
 import { type EnvironmentId, type ScopedProjectRef } from "@t3tools/contracts";
 import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
@@ -67,6 +68,7 @@ import {
   ListFilterIcon,
   PlusIcon,
   SettingsIcon,
+  HistoryIcon,
 } from "lucide-react";
 import {
   useEffect,
@@ -1206,6 +1208,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     if (isMobile) setOpenMobile(false);
     void handleNewThread(scopeProjectRef(group.environmentId, group.id));
   });
+  const [sessionBrowserProject, setSessionBrowserProject] = useState<SidebarProjectSnapshot | null>(
+    null,
+  );
   const handleProjectFolderContextMenu = useStableCallback(
     (group: SidebarProjectSnapshot, position: { x: number; y: number }) => {
       const api = readLocalApi();
@@ -1215,6 +1220,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           api.contextMenu.show(
             [
               { id: "new-thread", label: "New thread" },
+              { id: "browse-sessions", label: "Browse local agent sessions" },
               { id: "copy-path", label: "Copy path" },
               { id: "project-settings", label: "Project settings", icon: "settings" },
             ],
@@ -1225,6 +1231,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         switch (clicked.value) {
           case "new-thread":
             startThreadInProjectFolder(group);
+            return;
+          case "browse-sessions":
+            setSessionBrowserProject(group);
             return;
           case "copy-path":
             copyPathToClipboard(group.workspaceRoot, { path: group.workspaceRoot });
@@ -2891,6 +2900,12 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   const newThreadInProjectShortcutLabel = shortcutLabelForCommand(keybindings, "chat.newLocal");
   return (
     <>
+      {sessionBrowserProject ? (
+        <AgentSessionBrowser
+          project={sessionBrowserProject}
+          onClose={() => setSessionBrowserProject(null)}
+        />
+      ) : null}
       <ThreadContextDragGhost />
       <SidebarChromeHeader isElectron={isElectron} />
       <SidebarContent
@@ -3042,6 +3057,22 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                 primaryEnvironmentId={primaryEnvironmentId}
                                 machineByEnvironmentId={environmentMachineById}
                               />
+                            ) : null}
+                            {project ? (
+                              <Button
+                                size="icon-xs"
+                                variant="ghost-muted"
+                                aria-label={`Browse local agent sessions for ${project.displayName}`}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                onClick={(event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  dispatchProjectScopeMenu({ type: "open-changed", open: false });
+                                  setSessionBrowserProject(project);
+                                }}
+                              >
+                                <HistoryIcon />
+                              </Button>
                             ) : null}
                             {project ? (
                               <Button

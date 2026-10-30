@@ -274,6 +274,7 @@ function makeLocalCommandHarness(input: {
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly importedHistory?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -288,7 +289,9 @@ function makeLocalCommandHarness(input: {
   };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
-  const threadId = ThreadId.make("thread-native-account-command");
+  const threadId = ThreadId.make(
+    input.importedHistory ? "import:codex:local-session" : "thread-native-account-command",
+  );
   const runId = RunId.make("run-native-account-command");
   const rootNodeId = NodeId.make("root-native-account-command");
   const attemptId = RunAttemptId.make("attempt-native-account-command");
@@ -352,6 +355,7 @@ function makeLocalCommandHarness(input: {
       id: threadId,
       activeProviderThreadId: providerThreadId,
       projectId: ProjectId.make("project-native-account-command"),
+      ...(input.importedHistory ? { historyOrigin: "v1_import" as const } : {}),
       branch: input.worktreePath === undefined ? null : "feature/restore",
       worktreePath: input.worktreePath ?? null,
     } as OrchestrationV2ThreadProjection["thread"],
@@ -1445,3 +1449,24 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "keeps imported history viewable when native resume fails without creating a replacement",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        importedHistory: true,
+        historyReadFailureAfterFallback: "not used",
+      });
+      yield* harness.start;
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      expect(harness.projection().providerThreads[0]?.nativeThreadRef?.nativeId).toBe(
+        "native-resume-thread",
+      );
+      expect(JSON.stringify(harness.projection().turnItems)).toContain(
+        "original imported session could not be resumed",
+      );
+    }),
+);

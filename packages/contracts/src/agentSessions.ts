@@ -48,8 +48,52 @@ export const AgentSessionScanResult = Schema.Struct({
 });
 export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
 
+export const AgentSessionBrowseInput = Schema.Struct({
+  workspaceRoot: TrimmedNonEmptyString,
+  preview: Schema.optional(
+    Schema.Struct({
+      providerInstanceId: ProviderInstanceId,
+      providerSessionId: TrimmedNonEmptyString,
+    }),
+  ),
+});
+export type AgentSessionBrowseInput = typeof AgentSessionBrowseInput.Type;
+
+export const AgentSessionBrowseResult = Schema.Struct({
+  sessions: Schema.Array(
+    Schema.Struct({
+      provider: AgentSessionSource,
+      providerInstanceId: ProviderInstanceId,
+      providerSessionId: TrimmedNonEmptyString,
+      workspaceRoot: Schema.String,
+      title: Schema.String,
+      updatedAt: IsoDateTime,
+      resumeLimitation: Schema.NullOr(Schema.String),
+      historyLimitation: Schema.optional(Schema.String),
+      messages: Schema.Array(
+        Schema.Struct({
+          id: Schema.String,
+          role: Schema.Literals(["user", "assistant"]),
+          text: Schema.String,
+          createdAt: IsoDateTime,
+        }),
+      ),
+    }),
+  ),
+  limited: Schema.Boolean,
+});
+export type AgentSessionBrowseResult = typeof AgentSessionBrowseResult.Type;
+
 export const AgentSessionImportInput = Schema.Struct({
   projectId: ProjectId,
+  sessions: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        providerInstanceId: ProviderInstanceId,
+        providerSessionId: TrimmedNonEmptyString,
+      }),
+    ),
+  ),
   expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
 });
 export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;

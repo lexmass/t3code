@@ -1,3 +1,4 @@
+import * as AgentSessionCatalog from "../project/AgentSessionCatalog.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -237,7 +238,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
 const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
-      AgentSessionScanner.layer,
+      AgentSessionScanner.layer.pipe(Layer.provide(AgentSessionCatalog.layer)),
       layerProjectService,
       layerOrchestratorProvided,
       layerEventSink,

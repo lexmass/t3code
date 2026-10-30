@@ -297,3 +297,11 @@ several selected threads together. Choose **Wake thread** to bring a thread back
 A snoozed thread keeps working and stays hidden until its wake time, even while
 its agent wakes itself for background work. It comes back early only when it needs
 an approval or answer from you, when a run fails, or when you send it a message.
+
+## Continue a local agent conversation
+
+Open a project's context menu and choose **Browse local agent sessions**. Search by title or session ID, filter by Codex or Claude Code, and select a conversation to preview it before adding it. The project directory filters sessions to that workspace. To browse another directory, add or select its project first.
+
+Sessions come from the connected environment's configured provider homes, including `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. Codex conversations are read through its native session APIs, including archived conversations and histories that no longer have an uncompressed JSONL file. Adding a session copies its text history into T3 and keeps its native session identity. Open the added thread in the sidebar and send a message to continue with the original provider context. Repeated imports do not create another thread.
+
+The preview retains the first request and up to 200 recent text messages; tools and attachments are omitted. The provider still resumes its full stored context. A session marked **view only** can be added for reading but cannot be continued. If the original session or working directory is missing, inaccessible, or incompatible with the installed provider, T3 reports the failure and keeps the imported history. It does not replace an imported session with a new conversation automatically. Discovery and import leave provider transcripts untouched; continuing a session lets the provider append new activity normally.

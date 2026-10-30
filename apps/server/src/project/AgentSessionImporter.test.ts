@@ -162,8 +162,9 @@ const seedOwner = Effect.fn(function* (
 });
 
 const makeImporter = Effect.fn(function* (
-  candidates: ReadonlyArray<ReturnType<typeof candidate>>,
+  candidates: ReadonlyArray<AgentSessionScanner.AgentSessionRecentThread>,
   beforeTransaction: Effect.Effect<void> = Effect.void,
+  sessions?: ReadonlyArray<{ providerInstanceId: ProviderInstanceId; providerSessionId: string }>,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const events = yield* EventStore.EventStoreV2;
@@ -206,6 +207,7 @@ const makeImporter = Effect.fn(function* (
           ),
           Layer.mock(AgentSessionScanner.AgentSessionScanner)({
             recentThreads: () => Stream.fromIterable(candidates),
+            selectedThreads: () => Stream.fromIterable(candidates),
           }),
           Layer.mock(ProjectService.ProjectService)({
             getById: () =>
@@ -235,7 +237,10 @@ const makeImporter = Effect.fn(function* (
     ),
   );
   const importer = Context.get(context, AgentSessionImporter.AgentSessionImporter);
-  return { run: importer.importRecentAgentThreads({ projectId }), published };
+  return {
+    run: importer.importRecentAgentThreads({ projectId, ...(sessions ? { sessions } : {}) }),
+    published,
+  };
 });
 
 it.effect(
@@ -384,5 +389,59 @@ it.effect(
         resumeCursor: { threadId: source.source.providerSessionId },
         runtimePayload: { importedTranscripts: [source.source] },
       });
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect(
+  "imports only selected sessions and keeps view-only history without inventing a native ID",
+  () =>
+    Effect.gen(function* () {
+      const selected = candidate(CLAUDE_MODEL_SELECTION, "invalid-uuid", "claudeAgent");
+      const other = candidate(CODEX_MODEL_SELECTION, "not-selected");
+      const importer = yield* makeImporter([selected, other], Effect.void, [selected.source]);
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const records = yield* projections.getThreadRecords(importId(selected), [
+        "messages",
+        "providerThreads",
+      ]);
+      expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+      expect(records.thread.title).toContain("view only");
+      expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe("invalid-uuid");
+      expect(yield* Effect.option(projections.getThread(importId(other)))).toEqual(Option.none());
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect(
+  "imports provider-managed history without requiring a rollout file and preserves its resume identity",
+  () =>
+    Effect.gen(function* () {
+      const fileCandidate = candidate(CODEX_MODEL_SELECTION, "native-paginated");
+      const native: AgentSessionScanner.AgentSessionRecentThread = {
+        _tag: "NativeImportable",
+        thread: fileCandidate.thread,
+        source: {
+          provider: "codex",
+          providerInstanceId: fileCandidate.source.providerInstanceId,
+          providerSessionId: fileCandidate.source.providerSessionId,
+        },
+      };
+      const importer = yield* makeImporter([native], Effect.void, [native.source]);
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const records = yield* projections.getThreadRecords(importId(fileCandidate), [
+        "messages",
+        "providerThreads",
+      ]);
+      expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
+      expect(records.providerThreads[0]?.nativeThreadRef?.nativeId).toBe("native-paginated");
+      const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const runtime = Option.getOrThrow(
+        yield* runtimes.getByThreadId({ threadId: importId(fileCandidate) }),
+      );
+      expect(runtime.resumeCursor).toEqual({ threadId: "native-paginated" });
+      expect(runtime.runtimePayload).toEqual({ cwd: "/workspace/project" });
     }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
