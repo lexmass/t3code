@@ -1784,13 +1784,43 @@ export const make = Effect.gen(function* () {
   const readNativeHistory = Effect.fn("AgentSessionScanner.readNativeHistory")(function* (
     entry: NativeCodexSession,
   ) {
-    return yield* codexCatalog
+    const history = yield* codexCatalog
       .read(entry.configuration, entry.session.id)
       .pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.timeout("30 seconds"),
         importReadLock.withPermits(1),
+        Effect.result,
       );
+    if (history._tag === "Success") return history.success;
+    const filePath = entry.session.path;
+    if (filePath?.endsWith(".jsonl")) {
+      const stats = yield* statOption(filePath);
+      const mtimeMs =
+        Option.isSome(stats) && Option.isSome(stats.value.mtime)
+          ? stats.value.mtime.value.getTime()
+          : null;
+      const fallback = yield* Stream.unwrap(
+        prepareRecentThreads(entry.session.cwd, [], true, [
+          {
+            cwd: entry.session.cwd,
+            source: "codex",
+            providerInstanceId: entry.providerInstanceId,
+            threadCount: 1,
+            lastActiveAtMs: null,
+            transcripts: [{ filePath, mtimeMs }],
+          },
+        ]),
+      ).pipe(Stream.runHead);
+      if (
+        Option.isSome(fallback) &&
+        fallback.value._tag === "Importable" &&
+        fallback.value.thread.providerSessionId === entry.session.id
+      ) {
+        return fallback.value.thread.messages;
+      }
+    }
+    return yield* history.failure;
   });
   const selectedThreads: AgentSessionScanner["Service"]["selectedThreads"] = (
     workspaceRoot,

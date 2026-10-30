@@ -318,6 +318,25 @@ export const layer: Layer.Layer<
       const providerThread = projection.providerThreads.find(
         (candidate) => candidate.id === run.providerThreadId,
       );
+      const importedNativeContext =
+        projection.thread.historyOrigin === "v1_import" &&
+        projection.thread.id.startsWith("import:") &&
+        providerThread?.nativeThreadRef?.strength === "strong";
+      const originalImportedContext =
+        importedNativeContext &&
+        projection.thread.id ===
+          `import:${providerThread?.providerInstanceId}:${providerThread?.nativeThreadRef?.nativeId}`;
+      // Legacy imports already exist in the original native session, including handoffs saved by older versions.
+      const contextHandoffs = projection.contextHandoffs.filter(
+        (handoff) =>
+          !(
+            originalImportedContext &&
+            handoff.toProviderThreadId === providerThread?.id &&
+            handoff.strategy === "manual_context" &&
+            handoff.transferId === null &&
+            handoff.fromProviderThreadIds.length === 0
+          ),
+      );
       const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
       const checkpointScope = projection.checkpointScopes.find(
         (candidate) => candidate.id === rootNode?.checkpointScopeId,
@@ -329,7 +348,7 @@ export const layer: Layer.Layer<
           .filter((transfer) => transfer.type === "subagent_result")
           .map((transfer) => transfer.id),
       );
-      const handoffs = projection.contextHandoffs.filter(
+      const handoffs = contextHandoffs.filter(
         (handoff) =>
           (handoff.transferId == null || !subagentResultTransfers.has(handoff.transferId)) &&
           handoff.status === "ready" &&
@@ -836,7 +855,7 @@ export const layer: Layer.Layer<
           previousUsage,
           knownModelWindow,
         });
-        const settledHandoffs = projection.contextHandoffs.filter(
+        const settledHandoffs = contextHandoffs.filter(
           (handoff) =>
             handoff.toProviderThreadId === providerThread.id &&
             handoff.delivery?.nativeThreadId === loadedProviderThread.nativeThreadRef?.nativeId &&
@@ -1038,6 +1057,20 @@ export const layer: Layer.Layer<
       };
       let resumedRetryHandoff: ReadonlyArray<OrchestrationV2ContextHandoff> | undefined;
       let resumedHandoffContext: ReturnType<typeof handoffContextForThread> | undefined;
+      const retainImportedSession = Effect.fn("ProviderTurnStartService.retainImportedSession")(
+        (cause: string) =>
+          loadFromProvider(
+            Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: projection.thread.id,
+                providerThreadId: providerThread.id,
+                runId,
+                cause,
+              }),
+            ),
+          ),
+      );
       const loadedProviderThread = yield* Effect.gen(function* () {
         if (nativeForkTransfer !== undefined) {
           const sourceProjection = yield* projectionStore.getThreadRecords(
@@ -1090,7 +1123,7 @@ export const layer: Layer.Layer<
             }),
           );
         }
-        const uncertainDelivery = projection.contextHandoffs.some(
+        const uncertainDelivery = contextHandoffs.some(
           (handoff) =>
             handoff.toProviderThreadId === providerThread.id &&
             handoff.delivery?.nativeThreadId === providerThread.nativeThreadRef?.nativeId &&
@@ -1131,6 +1164,10 @@ export const layer: Layer.Layer<
             Effect.catchTags({ ContextHandoffBudgetError: () => Effect.succeed(false) }),
           );
           if (fits) return resumed.success;
+          if (importedNativeContext)
+            return yield* retainImportedSession(
+              "The original imported session was resumed, but additional context does not fit its remaining budget. Its native context has been retained; start a separate thread if you need to continue with a history handoff.",
+            );
           const freshThread = { ...resumed.success, nativeThreadRef: null };
           const freshContext = handoffContextForThread(freshThread);
           const { handoff } = yield* recoveryHandoff;
@@ -1166,23 +1203,11 @@ export const layer: Layer.Layer<
             );
           }
         }
-        if (
-          projection.thread.historyOrigin === "v1_import" &&
-          projection.thread.id.startsWith("import:") &&
-          resumed._tag === "Failure" &&
-          !uncertainDelivery
-        ) {
-          return yield* loadFromProvider(
-            Effect.fail(
-              new ProviderAdapter.ProviderAdapterTurnStartError({
-                driver: session.driver,
-                threadId: projection.thread.id,
-                providerThreadId: providerThread.id,
-                runId,
-                cause:
-                  "The original imported session could not be resumed. Its saved history remains available; check the provider installation, session storage, and workspace before retrying, or start a new thread to continue separately.",
-              }),
-            ),
+        if (importedNativeContext) {
+          return yield* retainImportedSession(
+            uncertainDelivery
+              ? "History delivery to the original imported session is uncertain. Its native context has been retained to avoid replaying messages; inspect the original session or start a separate thread to continue."
+              : "The original imported session could not be resumed. Its saved history remains available; check the provider installation, session storage, and workspace before retrying, or start a new thread to continue separately.",
           );
         }
         resumedHandoffContext = undefined;

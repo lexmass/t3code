@@ -356,16 +356,34 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         };
         const native = { ...base, id: "migrated-native" };
         const unreadable = { ...base, title: "Unreadable session", id: "unreadable-native" };
+        const fallbackPath = path.join(codexHomePath, "sessions", "fallback-native.jsonl");
+        const fallbackText =
+          [
+            { type: "session_meta", payload: { id: "fallback-native", cwd: workspace } },
+            {
+              type: "event_msg",
+              payload: { type: "user_message", message: "File fallback prompt" },
+            },
+          ]
+            .map((record) => encodeTranscriptRecord(record))
+            .join("\n") + "\n";
+        yield* writeTranscript({ filePath: fallbackPath, contents: fallbackText, mtimeMs: 0 });
+        const fallback = {
+          ...base,
+          title: "Fallback session",
+          id: "fallback-native",
+          path: fallbackPath,
+        };
         const reads: string[] = [];
         const messages = [
           { role: "user" as const, text: "Original prompt", createdAt: base.createdAt },
           { role: "assistant" as const, text: "Original response", createdAt: base.updatedAt },
         ];
         const catalog = AgentSessionCatalog.CodexSessionCatalog.of({
-          list: () => Effect.succeed([native, unreadable]),
+          list: () => Effect.succeed([native, unreadable, fallback]),
           read: (_configuration, id) => {
             reads.push(id);
-            return id === unreadable.id
+            return id === unreadable.id || id === fallback.id
               ? Effect.fail(
                   new AgentSessionCatalog.AgentSessionCatalogError({
                     detail: "History unavailable",
@@ -387,6 +405,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           expect(listing.sessions.map((session) => session.title)).toEqual([
             "Start project2",
             "Unreadable session",
+            "Fallback session",
           ]);
           expect(listing.sessions.every((session) => session.messages.length === 0)).toBe(true);
           expect(reads).toEqual([]);
@@ -426,6 +445,31 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
               .pipe(Stream.runCollect),
           ).toEqual([{ _tag: "Skipped" }]);
           expect(yield* fs.exists(filePath)).toBe(false);
+          const fallbackSelection = { ...selected, providerSessionId: fallback.id };
+          const fallbackPreview = yield* scanner.browse({
+            projectId: ProjectId.make("project-1"),
+            preview: fallbackSelection,
+          });
+          expect(
+            fallbackPreview.sessions.find((session) => session.providerSessionId === fallback.id),
+          ).toMatchObject({
+            messages: [{ text: "File fallback prompt" }],
+          });
+          const fallbackImport = yield* scanner
+            .selectedThreads(workspace, [fallbackSelection])
+            .pipe(Stream.runCollect);
+          expect(fallbackImport).toMatchObject([
+            {
+              _tag: "NativeImportable",
+              source: { providerSessionId: fallback.id },
+              thread: {
+                messages: [{ text: "File fallback prompt" }],
+                model: "original-codex-model",
+                reasoningEffort: "xhigh",
+              },
+            },
+          ]);
+          expect(yield* fs.readFileString(fallbackPath)).toBe(fallbackText);
           expect(yield* fs.readFileString(`${filePath}.zst`)).toBe("preserved compressed original");
         }).pipe(
           Effect.provide(

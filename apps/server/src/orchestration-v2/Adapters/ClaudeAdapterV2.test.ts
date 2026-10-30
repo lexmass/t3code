@@ -2495,7 +2495,7 @@ describe("ClaudeAdapterV2 native session identity", () => {
   const openTurnWithOrdinal = (
     providerTurnOrdinal: number,
     nativeThreadHasTurns?: boolean,
-    explicitlyResumed = false,
+    resumeMode?: "imported" | "existing" | "failed-creation",
   ) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -2504,21 +2504,39 @@ describe("ClaudeAdapterV2 native session identity", () => {
         const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
           prefix: "t3-claude-v2-session-identity-",
         });
+        const path = yield* Path.Path;
+        if (resumeMode === "existing") {
+          const projectDir = path.join(attachmentsDir, "projects", "fixture");
+          yield* fileSystem.makeDirectory(projectDir, { recursive: true });
+          yield* fileSystem.writeFileString(
+            path.join(projectDir, "native-session-identity.jsonl"),
+            JSON.stringify({
+              type: "user",
+              message: { role: "user", content: "Existing context" },
+            }) + "\n",
+          );
+        }
         const openedQueries: Array<ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput> = [];
         const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
           instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
           settings: DEFAULT_CLAUDE_SETTINGS,
-          environment: {},
+          environment: { CLAUDE_CONFIG_DIR: attachmentsDir },
           attachmentsDir,
           fileSystem,
-          path: yield* Path.Path,
+          path,
           crypto: yield* Crypto.Crypto,
           idAllocator,
           queryRunner: {
             allocateSessionId: Effect.succeed("native-session-identity"),
             open: (input) =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 openedQueries.push(input);
+                if (resumeMode === "failed-creation" && openedQueries.length === 1) {
+                  return yield* new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                    method: "open",
+                    cause: "Session creation failed",
+                  });
+                }
                 return {
                   messages: Stream.empty,
                   offer: () => Effect.void,
@@ -2536,7 +2554,11 @@ describe("ClaudeAdapterV2 native session identity", () => {
             assertComplete: Effect.void,
           },
         });
-        const threadId = ThreadId.make("thread-claude-session-identity");
+        const threadId = ThreadId.make(
+          resumeMode === "imported"
+            ? "import:claudeAgent:native-session-identity"
+            : "thread-claude-session-identity",
+        );
         const providerSessionId = ProviderSessionId.make("provider-session-claude-identity");
         const runtime = yield* adapter.openSession({
           threadId,
@@ -2549,20 +2571,23 @@ describe("ClaudeAdapterV2 native session identity", () => {
           modelSelection: CLAUDE_TEST_MODEL_SELECTION,
           runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
         });
-        if (explicitlyResumed) yield* runtime.resumeThread({ providerThread });
         const now = yield* DateTime.now;
-        yield* runtime.startTurn(
-          makeClaudeTestTurnInput({
-            threadId,
-            providerThread,
-            now,
-            attemptId: RunAttemptId.make("run-attempt-claude-session-identity"),
-            text: "Respond with identity ok",
-            attachments: [],
-            providerTurnOrdinal,
-            ...(nativeThreadHasTurns === undefined ? {} : { nativeThreadHasTurns }),
-          }),
-        );
+        const turnInput = makeClaudeTestTurnInput({
+          threadId,
+          providerThread,
+          now,
+          attemptId: RunAttemptId.make("run-attempt-claude-session-identity"),
+          text: "Respond with identity ok",
+          attachments: [],
+          providerTurnOrdinal,
+          ...(nativeThreadHasTurns === undefined ? {} : { nativeThreadHasTurns }),
+        });
+        if (resumeMode === "failed-creation") {
+          const failed = yield* runtime.startTurn(turnInput).pipe(Effect.result);
+          assert.equal(failed._tag, "Failure");
+        }
+        if (resumeMode) yield* runtime.resumeThread({ providerThread });
+        yield* runtime.startTurn(turnInput);
         return openedQueries;
       }).pipe(
         Effect.provide(
@@ -2571,11 +2596,22 @@ describe("ClaudeAdapterV2 native session identity", () => {
       ),
     );
 
-  it.effect("resumes an imported native session before its first T3 provider turn", () =>
+  it.effect.each(["imported", "existing"] as const)(
+    "resumes an %s native session before its first T3 provider turn",
+    (mode) =>
+      Effect.gen(function* () {
+        const queries = yield* openTurnWithOrdinal(1, false, mode);
+        assert.equal(queries[0]?.options.resume, "native-session-identity");
+        assert.equal(queries[0]?.options.sessionId, undefined);
+      }),
+  );
+
+  it.effect("retries creation after an allocated native session failed to open", () =>
     Effect.gen(function* () {
-      const queries = yield* openTurnWithOrdinal(1, false, true);
-      assert.equal(queries[0]?.options.resume, "native-session-identity");
-      assert.equal(queries[0]?.options.sessionId, undefined);
+      const queries = yield* openTurnWithOrdinal(1, false, "failed-creation");
+      assert.equal(queries.length, 2);
+      assert.equal(queries[1]?.options.sessionId, "native-session-identity");
+      assert.equal(queries[1]?.options.resume, undefined);
     }),
   );
 
